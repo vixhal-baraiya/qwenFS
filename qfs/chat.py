@@ -100,7 +100,8 @@ class Chat:
         else:
             self.cache, version = disk.mount(self.m, mount, self.dev)
             self.pager = disk.Pager(self.m, mount, version)
-        self.paged = None            # (I, bytes) of a file the last feed paged in
+        self.paged = None            # (I, bytes, rows) of a file the last feed paged in
+        self.pages = []              # every page-in: (token position, rows, I)
 
     @torch.no_grad()
     def feed(self, new):
@@ -108,6 +109,8 @@ class Chat:
         self.paged = None
         if self.pager is not None and len(new) == 1:   # read acks are generated, one at a time
             self.paged = self.pager(self.cache, new[0])
+            if self.paged:
+                self.pages.append((len(self.ids), self.paged[2], self.paged[0]))
         out = self.m(input_ids=torch.tensor([new], device=self.dev), past_key_values=self.cache,
                      use_cache=True)
         self.cache = out.past_key_values

@@ -31,9 +31,10 @@ NO_TOKEN = 0xFFFFFFFF
 REC = np.dtype([("name", "<u4", F.NSLOT), ("i", "u1"), ("v", "u1")])
 
 
-def compact(toks):
-    """{I: (path, V, text)} of the latest version of each file, from a session's token log."""
-    files = {}
+def writes(toks):
+    """Every write in a session's token log, in order: (I, V, path, text start, text end), the
+    text being toks[start:end]."""
+    out = []
     for p, t in enumerate(toks):
         if not (F.ACKW0 <= t < F.ACKR0):
             continue
@@ -45,8 +46,13 @@ def compact(toks):
         ts = after(F.EQTEXT, p)
         te = next(k for k in range(ts, p) if toks[k] == F.NL and toks[k + 1] == F.LTS)
         ns = after(F.EQNAME, ts)
-        files[i] = (tuple(toks[ns:toks.index(F.NL, ns)]), v, toks[ts:te])
-    return files
+        out.append((i, v, tuple(toks[ns:toks.index(F.NL, ns)]), ts, te))
+    return out
+
+
+def compact(toks):
+    """{I: (path, V, text)} of the latest version of each file, from a session's token log."""
+    return {i: (name, v, toks[ts:te]) for i, v, name, ts, te in writes(toks)}
 
 
 def compact_links(toks, files, links=()):
@@ -265,8 +271,8 @@ class Pager:
         self.loaded, self.load_s, self.load_bytes = set(), 0.0, 0
 
     def __call__(self, cache, tok):
-        """Page in the file `tok` acks, if it is stored and not yet loaded; returns (I, bytes)
-        when it paged one."""
+        """Page in the file `tok` acks, if it is stored and not yet loaded; returns (I, bytes,
+        rows) when it paged one."""
         if not (F.ACKR0 <= tok < F.NONE):
             return None
         i, v = (tok - F.ACKR0) >> F.VB, (tok - F.ACKR0) & ((1 << F.VB) - 1)
@@ -280,7 +286,7 @@ class Pager:
         self.load_s += time.perf_counter() - t0
         self.load_bytes += nbytes
         self.loaded.add((i, v))
-        return i, nbytes
+        return i, nbytes, k.shape[2]
 
 
 class Session:

@@ -36,8 +36,14 @@ class FakeSession:
         self.stats = {"calls": 0}
 
     def state(self):
-        return {"files": dict(self.files), "links": set(self.links), "rows": 9, "lookup": 1,
-                "mounted": self.where}
+        vbits = [F.bits(self.files[i][1], F.VB) if i in self.files else [0] * F.VB
+                 for i in range(F.NFILE)]
+        rows = 1500 + 40 * len(self.files)
+        copy = [(1400 + 40 * k, 1407 + 40 * k, "file", i) for k, i in enumerate(self.files)]
+        if self.mounted:
+            copy.append((1450, 1457, "paged", 0))
+        return {"files": dict(self.files), "links": set(self.links), "rows": rows,
+                "lookup": 1, "vbits": vbits, "copy": copy, "mounted": self.where}
 
     def save(self, path):
         Path(path).mkdir(parents=True, exist_ok=True)
@@ -140,13 +146,15 @@ async def run(shot=None):
         tools = list(app.query(tui.Tool))
         check("a write renders as one tool line", len(tools) == 1 and tools[0].label == "write_file")
         check("its response is under it", "saved" in text_of(app) and "file 0 · version 1" in text_of(app))
-        check("the panel shows the file", "alice.txt" in fs.draw_files().plain
-              and "people/" in fs.draw_files().plain)
+        check("the panel shows the file", "alice.txt" in fs.draw_tree().plain
+              and "people/" in fs.draw_tree().plain and "slot 0: people/alice.txt"
+              in fs.draw_table().plain)
         check("Qwen's answer renders", any(a.shown.startswith("I saved Alice") for a in app.query(tui.Answer)))
         check("no draft is left", not app.query(tui.Draft))
         app.send("Save projects/cafe.txt and Link Alice to it")
         await wait_idle(pilot, app)
-        check("a link shows in the panel", "→" in fs.draw_links().plain)
+        check("a link sets its bit in the panel", fs.draw_links().plain.count("■") == 1)
+        check("the copy layer shows file rows", "■ text" in fs.draw_copy().plain)
         check("the hint counts files and links", "2 files" in str(app.query_one("#hint").render())
               and "1 link" in str(app.query_one("#hint").render()))
         app.send("missing file")

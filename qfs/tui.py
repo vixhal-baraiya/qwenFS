@@ -61,9 +61,11 @@ FPS = 12
 NARROW = 100  # columns: below this the panel hides itself
 SAMPLE = 6  # frames per throughput sample (half a second)
 
-# the panel's lights: each has a dark base and a lit colour
-LIT, FILE, LINK = (230, 140, 90), (120, 210, 150), (110, 160, 240)
-OFF, DIM = (44, 48, 54), (110, 116, 126)
+# the panel's lights: each part has a dark base and a lit colour
+LIT, STAGE, QWEN = (240, 190, 90), (230, 140, 90), (110, 160, 240)
+FILE_ON, REG, OLD = (120, 200, 140), (90, 160, 115), (60, 92, 76)
+LINK, MEM, CTX = (90, 140, 220), (110, 160, 240), (58, 64, 74)
+OFF, DIM, ERR_RGB = (44, 48, 54), (110, 116, 126), (215, 117, 117)
 
 
 def hard_breaks(text: str) -> str:
@@ -255,76 +257,103 @@ def indented(t: Text, first: bool = True) -> Text:
 # --- the filesystem panel ---------------------------------------------------------------------
 
 class FSView(Vertical):
-    """The filesystem as the model holds it: a status card, the files and folders, the links,
-    the FS layers lighting up as they act, and the disk."""
+    """The filesystem as the model holds it, drawn as the circuit's own parts: a status card, the
+    FS layers as a pipeline, the file table (the version table's 32 rows), the link bits (layer
+    6's table), the copy layer's rows, the folders, and the disk."""
 
     def __init__(self) -> None:
         super().__init__(id="fs")
         self.mon = Monitor()
-        self.state = {"files": {}, "links": set(), "rows": 0, "lookup": 0, "mounted": None}
+        self.state = {"files": {}, "links": set(), "rows": 0, "lookup": 0, "mounted": None,
+                      "vbits": [[0] * F.VB for _ in range(F.NFILE)], "copy": []}
         self.meta: dict = {}
         self.model = ""
         self.doing = ""  # what the circuit is doing, for the status card
         self.fed = self.fed_seen = 0
         self.rates: deque = deque([0.0] * 34, maxlen=34)  # tok/s, one per SAMPLE frames
         self.touched: dict[int, float] = {}  # file -> its light
-        self.linked: dict[tuple, float] = {}
+        self.linked: dict[tuple, float] = {}  # a new link -> its light
+        self.unlinked: dict[tuple, float] = {}  # a removed link, fading out
+        self.current: int | None = None  # the file the response is about
+        self.last: int | None = None  # the file touched last
         self.disk: dict = {}  # the last save or mount
         self.n = 0
-        self.top, self.files, self.links, self.circuit, self.drive = (
-            Static(classes="card", id=f"f-{k}") for k in ("top", "files", "links", "layers",
-                                                          "disk"))
+        self.cards = {k: Static(classes="card", id=f"f-{k}") for k in
+                      ("top", "pipe", "table", "links", "copy", "tree", "disk")}
 
     def compose(self) -> ComposeResult:
-        yield self.top
-        yield self.files
-        yield self.links
-        yield self.circuit
-        yield self.drive
+        yield from self.cards.values()
 
     def on_mount(self) -> None:
-        self.top.border_title, self.files.border_title = "filesystem", "files"
-        self.links.border_title, self.circuit.border_title = "links", "circuit"
-        self.drive.border_title = "disk"
+        c = self.cards
+        c["top"].border_title, c["pipe"].border_title = "filesystem", "pipeline"
+        c["table"].border_title, c["links"].border_title = "file table", "link bits"
+        c["copy"].border_title, c["tree"].border_title = "copy layer", "folders"
+        c["disk"].border_title = "disk"
+        c["pipe"].border_subtitle = "the FS layers, then Qwen's"
+        c["table"].border_subtitle = "layer 4 · version table"
 
     def feed(self, d: dict) -> None:
-        self.mon.feed(d["t"], d["phase"], d["func"])
+        t, phase = d["t"], d["phase"]
+        self.mon.feed(t, phase, d["func"])
         self.fed += 1
+        self.state["rows"] += 1  # each token is a copy-layer row (the next fs event is exact)
+        if phase != "response":
+            self.current = None
+        elif F.ACKW0 <= t < F.NONE:
+            x = t - (F.ACKW0 if t < F.ACKR0 else F.ACKR0)
+            self.current = x >> F.VB
+            self.touch(self.current)
+        elif F.MARK0 <= t < F.MARK0 + F.NFILE:
+            self.touch(t - F.MARK0)
+        elif self.current is not None and d["func"] == "read_file":
+            self.touch(self.current)  # the text being copied
 
     def update_fs(self, st: dict) -> None:
-        new = st["links"] - self.state["links"]
-        for pair in new:
+        for pair in st["links"] - self.state["links"]:
             self.linked[pair] = 1.0
+        for pair in self.state["links"] - st["links"]:
+            self.unlinked[pair] = 1.0
         self.state = st
 
     def touch(self, i: int) -> None:
         self.touched[i] = 1.0
+        self.last = i
 
     def frame(self) -> None:
         self.n += 1
         if self.n % SAMPLE == 0:
             self.rates.append((self.fed - self.fed_seen) * FPS / SAMPLE)
             self.fed_seen = self.fed
-        self.top.border_subtitle = self.model
+        c = self.cards
+        c["top"].border_subtitle = self.model
         if "fs_layers" in self.meta:
-            self.top.border_title = f"filesystem · in {self.meta['fs_layers']} layers of Qwen"
+            c["top"].border_title = f"filesystem · in {self.meta['fs_layers']} layers of Qwen"
         room = self.parent.size.height if self.parent else 0
         sized = room > 0  # before the first layout every card shows
-        w = self.width_of(self.files)
+        w = self.width_of(c["table"])
 
         def lines(x: Text) -> int:  # a card's height: its lines as wrapped, and its border
             return sum(max(1, -(-cell_len(ln) // w)) for ln in x.plain.split("\n")) + 2
 
-        # in order of importance: a card that does not fit in what is left is not shown
-        for card, text in ((self.top, self.draw_top()), (self.files, self.draw_files()),
-                           (self.circuit, self.draw_layers()), (self.links, self.draw_links()),
-                           (self.drive, self.draw_disk())):
-            card.display = not sized or lines(text) <= room
-            room -= lines(text) if card.display else 0
-            card.update(text)
+        draw = {"top": self.draw_top, "pipe": self.draw_pipe, "table": self.draw_table,
+                "links": self.draw_links, "copy": self.draw_copy, "tree": self.draw_tree,
+                "disk": self.draw_disk}
+        texts = {k: f() for k, f in draw.items()}
+        core = ("top", "pipe", "table", "links", "copy")
+        if sized and sum(lines(texts[k]) for k in core) > room:  # a short window: compact
+            texts["pipe"], texts["table"] = self.draw_pipe(True), self.draw_table(True)
+        for k, text in texts.items():  # in order: a card that does not fit is not shown
+            c[k].display = not sized or lines(text) <= room
+            room -= lines(text) if c[k].display else 0
+            c[k].update(text)
         self.mon.tick()
-        self.touched = {k: v * Monitor.FADE for k, v in self.touched.items() if v > 0.02}
-        self.linked = {k: v * Monitor.FADE for k, v in self.linked.items() if v > 0.02}
+        fade = Monitor.FADE
+
+        def dim(d: dict) -> dict:
+            return {k: v * fade for k, v in d.items() if v > 0.02}
+        self.touched, self.linked, self.unlinked = (dim(self.touched), dim(self.linked),
+                                                   dim(self.unlinked))
 
     @staticmethod
     def width_of(card: Static) -> int:
@@ -332,28 +361,169 @@ class FSView(Vertical):
 
     def path(self, i: int) -> str:
         f = self.state["files"].get(i)
-        return f[0] if f else f"file {i}"
+        return f[0] if f else f"slot {i}"
 
     def draw_top(self) -> Text:
-        t, w = Text(), self.width_of(self.top)
-        live = any(x > 0.3 for x in self.mon.lights[:-1])
+        t, w = Text(), self.width_of(self.cards["top"])
         if self.doing:
             t.append("● ", style=ACCENT)
             t.append(short_text(self.doing, w - 2), style="bold")
         else:
             t.append("○ idle", style="dim")
         t.append("\ntok/s ", style="dim")
-        t.append(spark(self.rates, w - 13), style=ACCENT if live or self.doing else "dim")
+        t.append(spark(self.rates, w - 13), style=ACCENT if self.doing else "dim")
         t.append(f" {self.rates[-1]:5.1f}", style="bold" if self.doing else "dim")
         st = self.state
         n, k = len(st["files"]), len(st["links"])
-        t.append(f"\n{n} of {F.NFILE} files · {k} link{'s' * (k != 1)} · "
-                 f"{self.mon.forced:,} forced tokens · copy layer {st['rows']:,} rows",
-                 style="dim")
+        t.append(f"\n{n}/{F.NFILE} files · {k} link{'s' * (k != 1)} · "
+                 f"{self.mon.forced:,} forced tokens", style="dim")
         return t
 
-    def draw_files(self) -> Text:
-        t, w = Text(), self.width_of(self.files)
+    def draw_pipe(self, compact: bool = False) -> Text:
+        """The FS layers as boxes, lit as they act on a token, then Qwen's layers as a bar."""
+        t, w = Text(), self.width_of(self.cards["pipe"])
+        names = ["lags", "parse", "path", "lookup", "tables", "forced", "links", "copy"]
+        lights = self.mon.lights
+        if compact:
+            for k, (layer, _, _) in enumerate(LAYERS):
+                t.append(f"[{layer}]", style=light(lights[k], STAGE, DIM))
+                t.append("›" if k < len(LAYERS) - 1 else "", style="dim")
+        else:
+            inner = max(4, min(8, (w - 9) // 4 - 2))
+            for row in range(2):
+                rows: list[list] = [[], [], []]
+                for k in range(4 * row, 4 * row + 4):
+                    c = light(lights[k], STAGE, DIM)
+                    kind = "ΔNet" if LAYERS[k][1] == "DeltaNet" else "attn"
+                    head = f"{LAYERS[k][0]}·{kind}"
+                    box = (f"┌{head:─<{inner}}┐", f"│{short_text(names[k], inner):^{inner}}│",
+                           f"└{'─' * inner}┘")
+                    for i, piece in enumerate(box):
+                        rows[i].append((piece, c))
+                        if k % 4 < 3:
+                            rows[i].append(("─›─" if i == 1 else "   ", "dim"))
+                for r in rows:
+                    t.append("\n" if t.plain else "")
+                    for piece, st in r:
+                        t.append(piece, style=st)
+        q = self.meta.get("qwen_layers", 24)
+        t.append("\n ╰›  ", style="dim")
+        for k in range(q):
+            t.append("▮", style=light(lights[-1], QWEN, OFF))
+        t.append(f"  Qwen ×{q}", style="bold" if lights[-1] > 0.3 else "dim")
+        return t
+
+    def draw_table(self, compact: bool = False) -> Text:
+        """The version table: a column per file slot, whether it holds a file, and its version
+        bits as the DeltaNet row stores them."""
+        t, w = Text(), self.width_of(self.cards["table"])
+        files, vbits = self.state["files"], self.state["vbits"]
+        gap = " " if w >= 6 + 2 * F.NFILE else ""
+        cw = 1 + len(gap)
+        t.append(f"{'slot':<6}", style="dim")
+        ticks = "".join(f"{k:<{8 * cw}}" for k in range(0, F.NFILE, 8))
+        t.append(ticks.rstrip(), style="dim")
+        t.append(f"\n{'file':<6}", style="bold")
+        for i in range(F.NFILE):
+            h = self.touched.get(i, 0.0)
+            t.append(("●" if i in files else "·") + gap,
+                     style=light(h, LIT, FILE_ON if i in files else OFF))
+        rows = [] if compact else range(F.VB - 1, -1, -1)
+        for b in rows:
+            t.append(f"\n{f'v{b}':<6}", style="dim")
+            for i in range(F.NFILE):
+                on = vbits[i][b] if i < len(vbits) else 0
+                h = self.touched.get(i, 0.0)
+                t.append(("■" if on else "·") + gap,
+                         style=light(h if on else 0, LIT, REG if on else OFF))
+        if compact:
+            t.append(f"\n{'ver':<6}", style="dim")
+            for i in range(F.NFILE):
+                v = files[i][1] if i in files else 0
+                t.append((f"{v:x}"[-1] if i in files else "·") + gap,
+                         style=light(self.touched.get(i, 0.0), LIT, REG if i in files else OFF))
+        i = self.last
+        if i is not None and i in files:
+            path, v, n = files[i]
+            t.append(f"\nslot {i}: ", style="dim")
+            t.append(short_text(path, w - 22), style="bold")
+            t.append(f" · v{v} · {n} tok", style="dim")
+        else:
+            t.append("\nrow i of the table is file i's version", style="dim")
+        return t
+
+    def draw_links(self) -> Text:
+        """Layer 6's link bits: a row per source, a column per target (the slots in use)."""
+        t, w = Text(), self.width_of(self.cards["links"])
+        links, files = self.state["links"], self.state["files"]
+        n = min(F.NFILE, max(4, -(-max(len(files), 1) // 4) * 4))
+        self.cards["links"].border_subtitle = (f"layer 6 · {len(links)} of {n}×{n} set"
+                                               if links else "layer 6 · source × target")
+
+        def cell(s: int, d: int) -> str:
+            if (s, d) in self.unlinked:
+                return light(self.unlinked[(s, d)], ERR_RGB, OFF)
+            if (s, d) in links:
+                return light(self.linked.get((s, d), 0.0), LIT, LINK)
+            return light(0, OFF, OFF)
+
+        if n <= 12 and w >= 6 + 2 * n:  # a cell per bit
+            t.append("from↓ ", style="dim")
+            t.append("".join(f"{d:<2}" for d in range(n)).rstrip() + "  to", style="dim")
+            for s in range(n):
+                t.append(f"\n{s:>4}  ", style=light(self.touched.get(s, 0.0), LIT, DIM))
+                for d in range(n):
+                    on = (s, d) in links or (s, d) in self.unlinked
+                    t.append("■ " if on else "· ", style=cell(s, d))
+        else:  # two sources per line: the upper half block's colour over the lower's
+            t.append("from↓ ", style="dim")
+            t.append("".join(f"{d:<8}" for d in range(0, n, 8)).rstrip() + "  to", style="dim")
+            for s in range(0, n, 2):
+                t.append(f"\n{s:>4}  ", style="dim")
+                for d in range(n):
+                    up, lo = cell(s, d), cell(s + 1, d)
+                    t.append("▀", style=f"{up} on {lo}")
+        if not links:
+            t.append("\nlink_files sets a bit; unlink_files clears it", style="dim")
+        return t
+
+    def draw_copy(self) -> Text:
+        """The copy layer's rows: every token in the context is a row; a file's rows hold its
+        text, paged rows came from disk; a read lights the rows it copies."""
+        t, w = Text(), self.width_of(self.cards["copy"])
+        rows, segs = self.state["rows"], self.state.get("copy", [])
+        per, lines = max(16, w), 4
+        cells = per * lines
+        size_ = max(1, -(-rows // cells))  # rows per cell
+        rank = {"paged": 3, "file": 2, "old": 1}
+        owner: list = [None] * cells
+        for a, b, kind, i in segs:
+            for c in range(a // size_, min(cells, -(-b // size_))):
+                if owner[c] is None or rank[kind] > rank[owner[c][0]]:
+                    owner[c] = (kind, i)
+        used = -(-rows // size_) if rows else 0
+        for c in range(cells):
+            t.append("\n" if c and c % per == 0 else "")
+            if c >= used:
+                t.append("·", style=light(0, OFF, OFF))
+                continue
+            o = owner[c]
+            if o is None:
+                t.append("■", style=light(0, CTX, CTX))
+            else:
+                kind, i = o
+                base = {"paged": MEM, "file": FILE_ON, "old": OLD}[kind]
+                t.append("■", style=light(self.touched.get(i, 0.0), LIT, base))
+        t.append("\n")
+        for label, c in (("context", CTX), ("text", FILE_ON), ("old", OLD), ("disk", MEM)):
+            t.append("■ ", style=light(0, c, c))
+            t.append(f"{label}  ", style="dim")
+        self.cards["copy"].border_subtitle = (f"layer 7 · {rows:,} rows · {size_} per cell"
+                                              if rows else "layer 7 · attention rows")
+        return t
+
+    def draw_tree(self) -> Text:
+        t, w = Text(), self.width_of(self.cards["tree"])
         files = self.state["files"]
         if not files:
             t.append("no files yet", style="dim")
@@ -375,47 +545,14 @@ class FSView(Vertical):
             for k in leaves:
                 i, v, n = node[k]
                 h = self.touched.get(i, 0.0)
-                meta = f"v{v}  " + (f"{n} tok" if n else "empty")
+                meta = f"slot {i:<2} v{v}  " + (f"{n} tok" if n else "empty")
                 name = short_text(k, max(6, w - 2 * depth - len(meta) - 2))
                 t.append(("\n" if t.plain else "") + "  " * depth)
                 t.append(name, style=light(h, LIT, (205, 210, 215)))
                 t.append(" " * max(1, w - 2 * depth - cell_len(name) - len(meta)))
-                t.append(meta, style=light(h, FILE, DIM))
+                t.append(meta, style=light(h, FILE_ON, DIM))
 
         walk(tree, 0)
-        return t
-
-    def draw_links(self) -> Text:
-        t, w = Text(), self.width_of(self.links)
-        links = sorted(self.state["links"])
-        if not links:
-            t.append("no links yet · link_files makes one", style="dim")
-            return t
-        left = max(cell_len(self.path(s)) for s, _ in links)
-        left = min(left, (w - 3) // 2)
-        for k, (s, d) in enumerate(links):
-            h = self.linked.get((s, d), 0.0)
-            t.append("\n" if k else "")
-            t.append(f"{short_text(self.path(s), left):<{left}}", style=light(h, LIT, (205, 210, 215)))
-            t.append(" → ", style=light(h, LINK, DIM))
-            t.append(short_text(self.path(d), w - left - 3), style=light(h, LIT, (205, 210, 215)))
-        return t
-
-    def draw_layers(self) -> Text:
-        t, w = Text(), self.width_of(self.circuit)
-        for k, (name, kind, what) in enumerate(LAYERS):
-            h = self.mon.lights[k]
-            t.append("\n" if k else "")
-            t.append("● ", style=light(h, LIT, OFF))
-            t.append(f"{name:<2}", style="bold")
-            t.append(f"{kind:<10}", style="dim")
-            t.append(short_text(what, w - 14), style=light(h, (230, 232, 235), DIM))
-        h = self.mon.lights[-1]
-        q = self.meta.get("qwen_layers", 24)
-        t.append("\n")
-        t.append("● ", style=light(h, LINK, OFF))
-        t.append(f"Qwen's {q} layers", style="bold")
-        t.append("  its own text", style="dim")
         return t
 
     def draw_disk(self) -> Text:

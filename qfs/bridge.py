@@ -90,7 +90,26 @@ class Session:
         st = monitor.read(self.chat.cache)
         files = {i: (self.path(n), v, self.sizes.get(i, 0)) for i, (n, v) in st["files"].items()}
         return {"files": files, "links": st["links"], "rows": st["rows"], "lookup": st["lookup"],
-                "mounted": self.where}
+                "vbits": st["vbits"], "copy": self.copy_map(st["files"]), "mounted": self.where}
+
+    def copy_map(self, live):
+        """The copy layer's rows as segments (start, end, kind, I): every token is a row
+        ("context"), a written text's rows hold that file ("file", the latest version, or "old"),
+        and a file paged in from disk adds its rows where it was paged ("paged")."""
+        pages = self.chat.pages
+
+        def row(pos):
+            return pos + sum(n for p, n, _ in pages if p <= pos)
+
+        segs, shift = [], 0
+        for p, n, i in pages:
+            segs.append((p + shift, p + shift + n, "paged", i))
+            shift += n
+        for i, v, _, ts, te in disk.writes(self.chat.ids):
+            if te > ts:
+                kind = "file" if live.get(i, (None, -1))[1] == v else "old"
+                segs.append((row(ts), row(te - 1) + 1, kind, i))
+        return sorted(segs)
 
     def restore(self):
         """After an interrupt: a new chat on the files so far (the context is cleared, the
@@ -161,6 +180,8 @@ class Session:
                 phase = "after"
             elif phase == "after" and t == F.NL2:
                 phase, func = "qwen", None             # the new assistant turn's text
+        self._sizes()
+        yield Event("fs", self.state())
         self.stats["turns"] += 1
         self.stats["tokens"] += n
         self.stats["seconds"] += time.time() - t0
@@ -183,7 +204,7 @@ class Session:
         text = self.tok.decode(pieces[0]) + "".join("- " + self.tok.decode(p) for p in pieces[1:])
         out = {"func": func, "lines": text.strip("\n").split("\n"), "ack": ack, "paged": None}
         if paged:
-            out["paged"] = {"i": paged[0], "bytes": paged[1]}
+            out["paged"] = {"i": paged[0], "bytes": paged[1], "rows": paged[2]}
         return out
 
     def _sizes(self):

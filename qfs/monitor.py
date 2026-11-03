@@ -35,13 +35,14 @@ def value(bs):
 
 def read(cache):
     """{"count": n, "files": {I: (path tokens, V)}, "links": {(S, D)}, "rows": copy-layer rows,
-    "lookup": lookup rows} from a cache's state."""
+    "lookup": lookup rows, "vbits": each slot's version bits} from a cache's state."""
     def state(li):            # a layer's state, or None before the first token
         r = getattr(cache.layers[li], "recurrent_states", None)
         return r[0][0] if r is not None and len(r) and r[0] is not None else None
     rec = {li: x for li in (TABLE, PAIR, COUNTL) if (x := state(li)) is not None}
     if TABLE not in rec:
-        return {"count": 0, "files": {}, "links": set(), "rows": 0, "lookup": 0}
+        return {"count": 0, "files": {}, "links": set(), "rows": 0, "lookup": 0,
+                "vbits": [[0] * F.VB for _ in range(F.NFILE)]}
     table = rec[TABLE][:, :F.NFILE, :2 * F.IDB].float().cpu()
     count = value(bits01(rec[COUNTL][F.NSLOT + 1, 0, :2 * F.IB].float().cpu(), F.IB))
     if table[0].abs().sum() and not count:     # 32 files wrap the 5-bit count to 0
@@ -68,8 +69,9 @@ def read(cache):
     def length(li):
         c = cache.layers[li]
         return c.keys.shape[-2] if getattr(c, "keys", None) is not None else 0
+    vbits = [bits01(table[0, i], F.VB) if i < count else [0] * F.VB for i in range(F.NFILE)]
     return {"count": count, "files": files, "links": links, "rows": length(COPY),
-            "lookup": length(LOOKUP)}
+            "lookup": length(LOOKUP), "vbits": vbits}
 
 
 class Monitor:
