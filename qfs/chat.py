@@ -1,7 +1,8 @@
 """Chat with the merged model; Qwen saves and reads files through the filesystem in its weights.
 
-There is no host: the loop only decodes greedily and stops at <|im_end|>. When Qwen writes a
-write_file or read_file tool call, the circuit prints the tool response inside the same turn.
+There is no host: the loop only decodes and stops at <|im_end|>. When Qwen writes a tool call,
+the circuit prints the tool response inside the same turn. A chat can start on a stored
+filesystem (`mount`); its files page in when the model emits their read acks.
 
 Usage: python -m qfs.chat MERGED "first message" ["second message" ...]
 """
@@ -14,6 +15,7 @@ from transformers import AutoTokenizer
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
 from qfs import circuit as F
+from qfs import disk
 
 TOOLS = [
     {"type": "function", "function": {
@@ -84,21 +86,42 @@ class Chat:
         self.dev, self.temp, self.top_p = dev, temp, top_p
         self.tok = AutoTokenizer.from_pretrained(path)
         self.m = Qwen3_5ForCausalLM.from_pretrained(path, dtype=torch.bfloat16).to(dev).eval()
+        disk.attach(self.m)
         self.reset(seed, system)
 
-    def reset(self, seed=0, system=None):
-        """A new conversation (and a new, empty filesystem) on the same model."""
+    def reset(self, seed=0, system=None, mount=None):
+        """A new conversation on the same model: on an empty filesystem, or on the one stored
+        at `mount`."""
         self.gen = torch.Generator(device="cpu").manual_seed(seed)
         self.system = system
-        self.ids, self.cache = [], None
+        self.ids, self.pager, self.mounted = [], None, mount
+        if mount is None:
+            self.cache = disk.FSCache(self.m.config)
+        else:
+            self.cache, version = disk.mount(self.m, mount, self.dev)
+            self.pager = disk.Pager(self.m, mount, version)
+        self.paged = None            # (I, bytes) of a file the last feed paged in
 
+    @torch.no_grad()
     def feed(self, new):
         """Run new tokens through the model; returns the next token."""
+        self.paged = None
+        if self.pager is not None and len(new) == 1:   # read acks are generated, one at a time
+            self.paged = self.pager(self.cache, new[0])
         out = self.m(input_ids=torch.tensor([new], device=self.dev), past_key_values=self.cache,
                      use_cache=True)
         self.cache = out.past_key_values
         self.ids += new
         return self.pick(out.logits[0, -1].float())
+
+    def save(self, path):
+        """Store the filesystem at `path`: the mounted image, if any, with this chat's writes,
+        links and unlinks applied. Returns the image's files ({I: (path, V, text)}) and links."""
+        files, links = disk.load(self.mounted) if self.mounted else ({}, set())
+        files.update(disk.compact(self.ids))
+        links = disk.compact_links(self.ids, files, links)
+        disk.save(files, path, links)
+        return files, links
 
     def pick(self, logits):
         """Greedy, or nucleus sampling at temperature temp. A forced token (an ack, a read-back,
@@ -111,24 +134,32 @@ class Chat:
         sp = sp * keep
         return int(si[torch.multinomial(sp / sp.sum(), 1, generator=self.gen)])
 
-    @torch.no_grad()
-    def turn(self, user, limit=600):
+    def prompt(self, user):
         if not self.ids:
             msgs = ([{"role": "system", "content": self.system}] if self.system else [])
-            prompt = self.tok.apply_chat_template(msgs + [{"role": "user", "content": user}], tools=TOOLS,
-                                                  tokenize=False, add_generation_prompt=True,
-                                                  enable_thinking=False)
-        else:
-            prompt = (f"\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
-                      "<think>\n\n</think>\n\n")
-        nxt = self.feed(self.tok(prompt).input_ids)
-        start = len(self.ids)
-        t0 = time.time()
-        while nxt != IM_END and len(self.ids) - start < limit:
+            return self.tok.apply_chat_template(msgs + [{"role": "user", "content": user}],
+                                                tools=TOOLS, tokenize=False,
+                                                add_generation_prompt=True, enable_thinking=False)
+        return (f"\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
+                "<think>\n\n</think>\n\n")
+
+    @torch.no_grad()
+    def stream(self, user, limit=600):
+        """One assistant turn, a token at a time: yields each token the model emits, then -1 if
+        the turn was cut at the limit (a cut turn is closed too)."""
+        nxt = self.feed(self.tok(self.prompt(user)).input_ids)
+        n = 0
+        while nxt != IM_END and n < limit:
+            yield nxt
             nxt = self.feed([nxt])
-        reply = self.ids[start:]
-        self.feed([IM_END])        # a turn cut at the limit is closed too
-        reply = reply + ([] if nxt == IM_END else [-1])
+            n += 1
+        self.feed([IM_END])
+        if nxt != IM_END:
+            yield -1
+
+    def turn(self, user, limit=600):
+        t0 = time.time()
+        reply = list(self.stream(user, limit))
         return show(self.tok, reply), len(reply), time.time() - t0
 
 
@@ -138,12 +169,15 @@ def main():
     ap.add_argument("messages", nargs="+")
     ap.add_argument("--temp", type=float, default=0.7, help="0 = greedy (a 2B model loops on tool calls when greedy)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--mount", help="start on the filesystem stored in this directory")
     ap.add_argument("--doc", default=str(Path(__file__).parents[1] / "docs" / "fs-agent.md"),
                     help="the system prompt (default: docs/fs-agent.md; '' for none)")
     a = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "mps"
     chat = Chat(a.merged, dev, temp=a.temp, seed=a.seed,
                 system=open(a.doc).read() if a.doc else None)
+    if a.mount:
+        chat.reset(a.seed, chat.system, mount=a.mount)
     for msg in a.messages:
         reply, n, dt = chat.turn(msg)
         print(f"\n### user: {msg}\n### assistant ({n} tokens, {dt:.0f}s):\n{reply}")

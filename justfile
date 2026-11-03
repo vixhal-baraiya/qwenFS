@@ -14,8 +14,12 @@ build:
     uv run hf download Qwen/{{model}} --local-dir models/{{model}}
     uv run python -m qfs.merge models/{{model}} {{merged}}
 
-# chat with Qwen and its filesystem (e.g. just chat "Save notes/todo.txt: call the dentist")
+# chat with Qwen and its filesystem (e.g. just chat --mount fs)
 chat *args:
+    uv run qfs {{merged}} {{args}}
+
+# send messages without the TUI (e.g. just ask "Save notes/todo.txt: call the dentist")
+ask *args:
     uv run python -m qfs.chat {{merged}} {{args}}
 
 # the circuit alone on scripted tool-call sessions (no Qwen needed)
@@ -25,6 +29,10 @@ test *args:
 # the filesystem saved to disk and read back in a fresh session
 test-disk *args:
     uv run python -m tests.test_disk {{args}}
+
+# the chat app, headless, on a scripted session (no model needed)
+test-tui *args:
+    uv run python -m tests.test_tui {{args}}
 
 # the merged model: Qwen's text unchanged, the filesystem exact
 check:

@@ -49,11 +49,11 @@ def compact(toks):
     return files
 
 
-def compact_links(toks, files):
-    """{(S, D)}: the links after every link_files / unlink_files call the model answered
-    "linked" / "removed"."""
+def compact_links(toks, files, links=()):
+    """{(S, D)}: `links`, then every link_files / unlink_files call the model answered "linked" /
+    "removed"."""
     index = {name: i for i, (name, _, _) in files.items()}
-    links, p = set(), 0
+    links, p = set(links), 0
     while F.TCSTART in toks[p:]:
         a = toks.index(F.TCSTART, p)
         b = toks.index(F.TCEND, a)
@@ -87,6 +87,18 @@ def save(files, path, links=()):
             path / "files" / f"{i}.tok")
     recs.tofile(path / "index.bin")
     np.array(sorted(links), dtype=np.uint8).reshape(-1, 2).tofile(path / "links.bin")
+
+
+def load(path):
+    """A stored image as ({I: (path, V, text)}, links), the form `compact` and `save` use."""
+    path = Path(path)
+    files = {}
+    for r in np.fromfile(path / "index.bin", dtype=REC):
+        i = int(r["i"])
+        name = tuple(int(t) for t in r["name"] if int(t) != NO_TOKEN)
+        files[i] = (name, int(r["v"]), load_tokens(path / "files" / f"{i}.tok")[0])
+    links = np.fromfile(path / "links.bin", dtype=np.uint8).reshape(-1, 2)
+    return files, {(int(a), int(b)) for a, b in links.tolist()}
 
 
 def load_tokens(f):
@@ -149,70 +161,153 @@ def dual(bits01):
     return out + [20.0] * (n_set - len(bits01))
 
 
+class FSCache(DynamicCache):
+    """The cache for a model with FS layers. The FS attention layers hold rows that are not
+    tokens (mounted paths, paged-in text), so their lengths are not the sequence's: positions and
+    mask sizes come from Qwen's first full-attention layer instead (in the circuit alone, which
+    has no Qwen layers, from the first layer as usual), and `attach` masks the FS layers."""
+
+    def __init__(self, config):
+        super().__init__(config=config)
+        types = config.layer_types
+        self.pos = next((i for i in range(len(F.LAYERS), len(types))
+                         if types[i] == "full_attention"), None)
+
+    def _at(self, layer_idx):
+        return self.pos if self.pos is not None and layer_idx in (0, LOOKUP, COPY) else layer_idx
+
+    def get_seq_length(self, layer_idx=0):
+        return super().get_seq_length(self._at(layer_idx))
+
+    def get_mask_sizes(self, query_length, layer_idx):
+        return super().get_mask_sizes(query_length, self._at(layer_idx))
+
+
+def attach(model):
+    """Masks for the FS attention layers: every stored row is visible to the new tokens, which
+    see each other causally. (A mask from token positions does not fit rows that are not tokens.)"""
+    if getattr(model, "_qfs_masks", False):
+        return
+
+    def hook(li):
+        def pre(mod, args, kw):
+            h = kw["hidden_states"] if "hidden_states" in kw else args[0]
+            q = h.shape[1]
+            if q == 1:
+                kw["attention_mask"] = None
+                return args, kw
+            c = kw.get("past_key_values")
+            n = c.layers[li].get_seq_length() if c is not None else 0
+            m = torch.ones(q, n + q, dtype=torch.bool, device=h.device)
+            m[:, n:] = torch.ones(q, q, dtype=torch.bool, device=h.device).tril()
+            kw["attention_mask"] = m[None, None]
+            return args, kw
+        return pre
+
+    for li in (LOOKUP, COPY):
+        model.model.layers[li].self_attn.register_forward_pre_hook(hook(li), with_kwargs=True)
+    model._qfs_masks = True
+
+
+def mount(model, path, dev):
+    """A fresh cache holding a stored filesystem: the tables and lookup rows from its index, an
+    empty copy layer (files page in on their read acks), everything else idle. Returns the cache
+    and {I: V} of the stored files."""
+    attach(model)
+    path = Path(path)
+    cache = FSCache(model.config)
+    recs = np.fromfile(path / "index.bin", dtype=REC)
+    net = model.model.layers[0].linear_attn
+    conv = torch.zeros(1, net.conv_dim, net.conv_kernel_size, dtype=torch.bfloat16, device=dev)
+    state = {li: torch.zeros(1, net.num_v_heads, F.DK, F.DK, dtype=torch.float32, device=dev)
+             for li, kind in enumerate(F.LAYERS) if kind == "linear_attention"}
+    for r in recs:
+        i = int(r["i"])
+        row = dual(F.bits(int(r["v"]), F.VB))                     # version table
+        state[TABLE][0, 0, i, :len(row)] = torch.tensor(row)
+        for j, c in enumerate(slot_codes(r)):                     # name table: a head per slot
+            vals = dual([(b + 1) // 2 for b in c])
+            state[TABLE][0, 1 + j, i, :len(vals)] = torch.tensor(vals)
+    links = np.fromfile(path / "links.bin", dtype=np.uint8).reshape(-1, 2)
+    for s_, d_ in links.tolist():                                  # link bits
+        r = (s_ % 4) * F.NFILE + d_
+        state[PAIR][0, s_ // 4, r, d_] = 20.0                      # the target's column
+        state[PAIR][0, 8 + s_ // 4, r, s_] = 20.0                  # the source's column
+    if recs.size:                                                  # file count
+        row = dual(F.bits(len(recs), F.IB))
+        state[COUNTL][0, F.NSLOT + 1, 0, :len(row)] = torch.tensor(row)
+    for li, rec in state.items():
+        layer = cache.layers[li]
+        layer.lazy_initialization(conv_states=conv, recurrent_states=rec, state_idx=0)
+        layer.conv_states[0].copy_(conv)
+        layer.recurrent_states[0].copy_(rec)
+        layer.has_previous_state[0] = True
+    put(cache, LOOKUP, *lookup_rows(model, recs))
+    n_kv = model.model.layers[COPY].self_attn.k_proj.out_features // F.HD
+    empty = torch.zeros(1, n_kv, 0, F.HD, dtype=torch.bfloat16, device=dev)
+    put(cache, COPY, empty, empty)
+    return cache, {int(r["i"]): int(r["v"]) for r in recs}
+
+
+def put(cache, layer, k, v):
+    c = cache.layers[layer]
+    c.keys, c.values = k, v
+    c.dtype, c.device = k.dtype, k.device
+    c.is_initialized = True
+
+
+class Pager:
+    """Pages a stored file's text into the copy layer when the model emits its read ack (a file
+    written in this session is already live)."""
+
+    def __init__(self, model, path, version):
+        self.m, self.path, self.version = model, Path(path), version
+        self.loaded, self.load_s, self.load_bytes = set(), 0.0, 0
+
+    def __call__(self, cache, tok):
+        """Page in the file `tok` acks, if it is stored and not yet loaded; returns (I, bytes)
+        when it paged one."""
+        if not (F.ACKR0 <= tok < F.NONE):
+            return None
+        i, v = (tok - F.ACKR0) >> F.VB, (tok - F.ACKR0) & ((1 << F.VB) - 1)
+        if (i, v) in self.loaded or self.version.get(i) != v:
+            return None
+        t0 = time.perf_counter()
+        body, nbytes = load_tokens(self.path / "files" / f"{i}.tok")
+        k, v_ = copy_rows(self.m, i, v, body)
+        c = cache.layers[COPY]
+        put(cache, COPY, torch.cat([c.keys, k], 2), torch.cat([c.values, v_], 2))
+        self.load_s += time.perf_counter() - t0
+        self.load_bytes += nbytes
+        self.loaded.add((i, v))
+        return i, nbytes
+
+
 class Session:
     """A fresh session on a stored filesystem, one token per step."""
 
     def __init__(self, model, path, dev, paging=True):
-        self.m, self.path, self.dev, self.paging = model, Path(path), dev, paging
-        self.cache = DynamicCache(config=model.config)
-        recs = np.fromfile(self.path / "index.bin", dtype=REC)
-        self.version = {int(r["i"]): int(r["v"]) for r in recs}
-        net = model.model.layers[0].linear_attn
-        conv = torch.zeros(1, net.conv_dim, net.conv_kernel_size, dtype=torch.bfloat16, device=dev)
-        state = {li: torch.zeros(1, net.num_v_heads, F.DK, F.DK, dtype=torch.float32, device=dev)
-                 for li, kind in enumerate(F.LAYERS) if kind == "linear_attention"}
-        for r in recs:
-            i = int(r["i"])
-            row = dual(F.bits(int(r["v"]), F.VB))                     # version table
-            state[TABLE][0, 0, i, :len(row)] = torch.tensor(row)
-            for j, c in enumerate(slot_codes(r)):                     # name table: a head per slot
-                vals = dual([(b + 1) // 2 for b in c])
-                state[TABLE][0, 1 + j, i, :len(vals)] = torch.tensor(vals)
-        links = np.fromfile(self.path / "links.bin", dtype=np.uint8).reshape(-1, 2)
-        for s_, d_ in links.tolist():                                  # link bits
-            r = (s_ % 4) * F.NFILE + d_
-            state[PAIR][0, s_ // 4, r, d_] = 20.0                      # the target's column
-            state[PAIR][0, 8 + s_ // 4, r, s_] = 20.0                  # the source's column
-        if recs.size:                                                  # file count
-            row = dual(F.bits(len(recs), F.IB))
-            state[COUNTL][0, F.NSLOT + 1, 0, :len(row)] = torch.tensor(row)
-        for li, rec in state.items():
-            layer = self.cache.layers[li]
-            layer.lazy_initialization(conv_states=conv, recurrent_states=rec, state_idx=0)
-            layer.conv_states[0].copy_(conv)
-            layer.recurrent_states[0].copy_(rec)
-            layer.has_previous_state[0] = True
-        self._put(LOOKUP, *lookup_rows(model, recs))
-        n_kv = model.model.layers[COPY].self_attn.k_proj.out_features // F.HD
-        empty = torch.zeros(1, n_kv, 0, F.HD, dtype=torch.bfloat16, device=dev)
-        self._put(COPY, empty, empty)
-        self.loaded, self.load_s, self.load_bytes = set(), 0.0, 0
+        self.m, self.dev = model, dev
+        self.cache, version = mount(model, path, dev)
+        self.pager = Pager(model, path, version) if paging else None
 
-    def _put(self, layer, k, v):
-        c = self.cache.layers[layer]
-        c.keys, c.values = k, v
-        c.dtype, c.device = k.dtype, k.device
-        c.is_initialized = True
+    @property
+    def loaded(self):
+        return self.pager.loaded if self.pager else set()
 
-    def _page(self, tok):
-        if not self.paging or not (F.ACKR0 <= tok < F.NONE):
-            return
-        i, v = (tok - F.ACKR0) >> F.VB, (tok - F.ACKR0) & ((1 << F.VB) - 1)
-        if (i, v) in self.loaded or self.version.get(i) != v:
-            return                                 # written in this session: already live
-        t0 = time.perf_counter()
-        body, nbytes = load_tokens(self.path / "files" / f"{i}.tok")
-        k, v_ = copy_rows(self.m, i, v, body)
-        c = self.cache.layers[COPY]
-        self._put(COPY, torch.cat([c.keys, k], 2), torch.cat([c.values, v_], 2))
-        self.load_s += time.perf_counter() - t0
-        self.load_bytes += nbytes
-        self.loaded.add((i, v))
+    @property
+    def load_s(self):
+        return self.pager.load_s if self.pager else 0.0
+
+    @property
+    def load_bytes(self):
+        return self.pager.load_bytes if self.pager else 0
 
     @torch.no_grad()
     def step(self, tok):
         """Feed one token; returns the model's next token."""
-        self._page(tok)
+        if self.pager:
+            self.pager(self.cache, tok)
         out = self.m(input_ids=torch.tensor([[tok]], device=self.dev), past_key_values=self.cache,
                      use_cache=True)
         self.cache = out.past_key_values

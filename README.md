@@ -87,6 +87,8 @@ projections. See `qfs/disk.py`.
   by hundreds of logits, so sampling never changes them.
 - **Disk paging** (`qfs/disk.py`): when the model emits a read ack, the runtime loads that
   file's bytes, like a disk controller. The model picks the file and copies the text.
+- **The app's panel** (`qfs/monitor.py`): it reads the filesystem out of the model's state (the
+  version, path and link tables) and keeps no copy of its own.
 
 ## The doc
 
@@ -134,12 +136,20 @@ Requirements: Python 3.11+, [uv](https://docs.astral.sh/uv/),
 git clone https://github.com/vixhal-baraiya/qwenFS && cd qwenFS
 just setup
 just build
-just chat "Save notes/todo.txt: call the dentist on Friday" "What's on my todo list?"
+just chat
 ```
 
-`just build` downloads Qwen3.5-2B and compiles the filesystem into it. `just` lists every
-recipe: `test` (the circuit alone, no Qwen needed), `test-disk`, `check` (the merged model) and
-`eval` (add `--doc docs/fs-agent.md` to use the doc).
+`just build` downloads Qwen3.5-2B and compiles the filesystem into it. `just chat` opens the
+chat app: each tool call shows as one line with the circuit's response under it, and the panel
+on the right is the filesystem as the model holds it, decoded from its DeltaNet state after
+every response: the files and folders, the links, the FS layers lighting up as they act, and
+the disk. `/save` stores the filesystem (in `fs/` by default) and `/mount` starts a new chat on
+a stored one, whose files page in when Qwen reads them; `/help` lists the rest.
+
+`just ask "Save notes/todo.txt: call the dentist" "What's on my todo list?"` sends messages
+without the app. `just` lists every recipe: `test` (the circuit alone, no Qwen needed),
+`test-disk`, `test-tui` (the app on a scripted session), `check` (the merged model) and `eval`
+(add `--doc docs/fs-agent.md` to use the doc).
 
 ## Repository
 
@@ -148,7 +158,10 @@ recipe: `test` (the circuit alone, no Qwen needed), `test-disk`, `check` (the me
 | `qfs/circuit.py` | The filesystem as Qwen3.5 layers: every weight, layer by layer |
 | `qfs/merge.py` | Building the merged Qwen3.5 checkpoint |
 | `qfs/disk.py` | The disk image: saving, mounting and paging files in |
-| `qfs/chat.py` | A terminal chat with the merged model |
+| `qfs/tui.py` | The chat app: the chat, and the filesystem panel |
+| `qfs/bridge.py` | The app's session: a turn as a stream of events |
+| `qfs/monitor.py` | The filesystem decoded from the model's state; the panel's lights |
+| `qfs/chat.py` | The chat loop, and a command-line chat |
 | `qfs/evaluate.py` | The scenario eval |
 | `qfs/gen_doc.py` | Writes `docs/fs-agent.md`, running its examples on the model |
 | `docs/fs-agent.md` | The filesystem reference Qwen gets as its system prompt |

@@ -9,9 +9,13 @@ dependencies = [
     "huggingface-hub>=0.30",
     "numpy>=1.26",
     "safetensors>=0.4",
+    "textual>=1.0",
     "torch>=2.8",
     "transformers>=5.19.0",
 ]
+
+[project.scripts]
+qfs = "qfs.tui:main"
 
 [build-system]
 requires = ["hatchling"]
