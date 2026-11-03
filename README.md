@@ -8,27 +8,6 @@ through its normal tool calls, and the model answers every call itself.
 
 ![qwenFS saving a file and reading it back: the FS layers, the file table and the copy layer, token by token](docs/qfs-demo.gif)
 
-A real session, token by token ([full-quality video](docs/qfs-demo.mp4)).
-
-```
-You:  Remember: Alice is a designer in Paris. Save her in a people folder.
-Qwen: write_file  people/alice.txt  "Alice is a designer in Paris."
-      → saved
-        - people/alice.txt
-You:  Alice works on the cafe project. Link her file to it.
-Qwen: link_files  people/alice.txt → projects/cafe.txt
-      → linked
-        - people/alice.txt
-        to
-        - projects/cafe.txt
-You:  Who works on the cafe project? Check which files link to it.
-Qwen: list_backlinks  projects/cafe.txt
-      → - people/alice.txt
-      Alice works on the cafe project.
-```
-
-Every `→` response above is printed by the circuit in Qwen's weights.
-
 ## How it works
 
 **The calls.** Qwen writes ordinary Qwen3.5 tool calls. The circuit reads each call as Qwen
