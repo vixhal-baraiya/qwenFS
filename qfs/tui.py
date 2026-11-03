@@ -29,7 +29,7 @@ from qfs.bridge import Cancelled, Event, Session
 from qfs.monitor import LAYERS, Monitor
 
 EXAMPLES = [
-    "Remember my friend Alice, a designer in Pune. Save her in the people folder.",
+    "Remember my friend Alice, a designer in Paris. Save her in the people folder.",
     "Save my shopping list at lists/shopping.txt: milk, eggs.",
     "Add bread to my shopping list.",
     "Save projects/cafe.txt: a new cafe opening in March. Link Alice's file to it.",

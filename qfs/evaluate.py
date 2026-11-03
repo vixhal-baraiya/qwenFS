@@ -60,9 +60,9 @@ SCENARIOS = {
          [call(R, path("name", "shopping"))], NO_LINKS + [call(W)], ["milk", "eggs", "bread"], []),
     ],
     "organize": [
-        ("Remember my friend Alice, a designer in Pune. Save her in the people folder.",
+        ("Remember my friend Alice, a designer in Paris. Save her in the people folder.",
          [call(W, path("name", "people/", "alice"))], NO_LINKS, [], []),
-        ("Also remember Bob, a chef in Mumbai, in the people folder.",
+        ("Also remember Bob, a chef in Tokyo, in the people folder.",
          [call(W, path("name", "people/", "bob"))], NO_LINKS, [], []),
         ("What files do I have saved?",
          [call(LF)], NO_LINKS + [call(W)], ["alice", "bob"], []),

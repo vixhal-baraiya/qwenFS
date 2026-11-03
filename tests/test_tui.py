@@ -14,7 +14,7 @@ from qfs import circuit as F
 from qfs import tui
 from qfs.bridge import Event
 
-ALICE = "Alice is a designer in Pune."
+ALICE = "Alice is a designer in Paris."
 
 
 class FakeSession:

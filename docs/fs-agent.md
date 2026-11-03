@@ -70,10 +70,10 @@ eggs
 bread
 Answer: Your shopping list has milk, eggs and bread.
 
-User: Remember my colleague Sam, an engineer in Delhi.
+User: Remember my colleague Sam, an engineer in Berlin.
 Tool call: write_file
   name: people/sam.txt
-  text: Sam is an engineer in Delhi.
+  text: Sam is an engineer in Berlin.
 Response:
 saved
 -people/sam.txt
