@@ -83,14 +83,17 @@ projections. See `qfs/disk.py`.
 `docs/fs-agent.md` is Qwen's system prompt by default: a reference for the tools, their
 responses and conventions, with worked examples. Every example response in it was printed by the
 merged model (`qfs/gen_doc.py`). In a scenario eval (save and recall, updating a list,
-organizing, links and backlinks, unlinking one file, a missing file; 3 seeds, 48 turns):
+organizing, searching, links and backlinks, unlinking one file, a missing file; 3 seeds, 57
+turns):
 
 | | Turns passed | Scenarios passed | Unneeded calls |
 |---|---|---|---|
-| No doc | 46/48 | 17/18 | 6 |
-| With the doc | 48/48 | 18/18 | 0 |
+| No doc | 49/57 | 17/21 | 42 |
+| With the doc | 57/57 | 21/21 | 0 |
 
-The sample is small; the drop in unneeded calls is the clearer effect.
+Without the doc, the misses are Qwen's calls, not the filesystem's answers: it saved Bob into
+`people/alice.txt` (a search for Tokyo then rightly found that file), or repeated a call until
+the turn ran out of tokens. The sample is small.
 
 ## Results
 
