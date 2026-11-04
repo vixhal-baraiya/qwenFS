@@ -5,6 +5,7 @@ Qwen writes ordinary Qwen3.5 tool calls; the circuit reads them as they are writ
 then opens a new assistant turn:
 
     write_file(name, text)      -> saved, then the path         ([w I V] ack, then a marker)
+    append_file(name, text)     -> saved, then the path         (the same, as a new segment)
     read_file(name)             -> the stored text, copied token for token, or "not found"
     list_files()                -> one path per line, or "empty"
     link_files(name, target)    -> linked, the two paths
@@ -35,14 +36,21 @@ How a call is read. The circuit keys on single tokens that Qwen's tool-call form
 "=name", "=text", "=target", "=file", "=path", "=query", ">", newline, "</", <tool_call>,
 </tool_call>, <tool_response>, </tool_response>. A call's kind comes from its parameters (a text
 makes a write, a target a link, a file a link listing, a path a backlink listing, a query a
-search, none a file listing); only unlink_files is told apart by its function name token,
-"unlink", which has no other spelling.
+search, none a file listing); only unlink_files and append_file are told apart by their
+function name tokens, "unlink" and "append", which have no other spelling.
+
+Segments. Every write or append is a version V of its file (a segment), its text keyed by
+(I, V, offset). A file is its segments from its base (its last write_file) to its latest
+version: an append adds a segment and keeps the base. A read starts at the base, and at the
+end of each segment but the last prints the next segment's read ack instead of
+</tool_response>: the ack restarts the offset counter, so a file holds up to 63 segments of up
+to ~590 tokens each.
 
 Where things live.
   file text      the copy layer's attention log, keyed by (index, version, offset)
   names          a lookup attention head: a path -> its index (the path's end is the not-found
                  fallback, scoring between an exact match and any near miss)
-  versions, paths, file count     DeltaNet rows (one row per file)
+  versions, bases, paths, file count     DeltaNet rows (one row per file)
   links          a table of link bits: row (source, target) of DeltaNet state, 4 sources x 32
                  targets per head, written by link and emptied by unlink. Rows store the target's
                  column in eight heads and the source's in eight more, so a multi-hot query over
@@ -50,8 +58,8 @@ Where things live.
   offsets        a decaying DeltaNet counter, alpha = 2^(-1/16) per token, read in the head
                  norm's eps regime and decoded by thresholds (exact to 600 tokens)
   words          a search head on the copy layer: each word of a written text is a row, keyed
-                 at the token after it by (index, version, the word's form; qfs/words.py), and
-                 a search asks for one file's current version and the query's form per token
+                 at the token after it by (index, base, the word's form; qfs/words.py), and a
+                 search asks for one file's current base and the query's form per token
 
 Layer P   DeltaNet  lag registers: flags of the previous one and two tokens, the forms and word
                     flags of the previous three
@@ -60,15 +68,17 @@ Layer 1   DeltaNet  counters (path slot, data offset) and call registers (naming
                     text, in text, unlink, target / file / path seen, listing, list index, tail)
           MLP       offset thermometer, path slots, GO (the newline that ends a path), keys
 Layer 2   DeltaNet  path slots (the path being read, token by token), op register, file count,
-                    the fourth token back's word flag, past the text's "</", a search call
+                    the fourth token back's word flag, past the text's "</", a search call, an
+                    append
           MLP       offset bits, file count one-hot, link-listing flag, a word's end, empty
                     query slots, the file a search checks
 Layer 3   attention lookup: the path at GO against the paths at earlier acks
           MLP       table query, the query's length
-Layer 4   DeltaNet  version table, path table (index -> path, for listings and echoes), the
-                    checked file's version
-          MLP       the write and read acks at GO, empty path slots
-Layer 5   DeltaNet  hold: the acks, the call's source and a link's target, from their GOs
+Layer 4   DeltaNet  version table, path table (index -> path, for listings and echoes), base
+                    table (read at a search's checked file and at GO), the read file's version
+          MLP       the write and read acks at GO, empty path slots, a read's next segment
+Layer 5   DeltaNet  hold: the acks, the call's source and a link's target, the written text's
+                    base, from their GOs
           MLP       the forced tokens: the response frame, echoes, the path printer, link-bit
                     write one-hots and listing queries
 Layer 6   DeltaNet  link bits
@@ -76,8 +86,9 @@ Layer 6   DeltaNet  link bits
                     the token after it, a check's query
 Layer 7   attention copy: a read's (index, version, offset) against the stored text; search:
                     a checked file's current version and the query against the words
-          MLP       exit: the output code into the id dims, link listings (the next set bit),
-                    search results (a marker or a skip per file), and every other FS dim cleared
+          MLP       exit: the output code into the id dims, a read's next segment, link
+                    listings (the next set bit), search results (a marker or a skip per file),
+                    and every other FS dim cleared
 
 Exactness. Every token carries a ballast, so each FS norm is a fixed scale (256). DeltaNet
 registers pad their set rails to 2, 8, 32 or 128, so reads come back exactly 0/1 or +-1. Bits
@@ -102,6 +113,7 @@ ACKW0, ACKR0, NONE = 122 << 11, 123 << 11, 124 << 11   # id = base + (I << VB) +
 MARK0 = 125 << 11                  # list markers: MARK0 + I
 SKIP0 = 126 << 11                  # search skips: SKIP0 + I
 UNLINK_TOKENS = (64778, 45896)     # "unlink", " unlink"
+APPEND = 4928                      # "append"
 SAVED, LINKED, REMOVED, TO = 31617, 41710, 44232, 951
 IDB, OB = 18, 11
 NMAX = 600
@@ -152,7 +164,7 @@ FLAG_TOKENS = {NL: "NL", GT: "GT", LTS: "LTS", EQNAME: "EQNAME", EQTEXT: "EQTEXT
                EQTARGET: "EQTARGET", EQFILE: "EQFILE", EQPATH: "EQPATH", EQQUERY: "EQQUERY",
                SAVED: "SAVED",
                LINKED: "LINKED", REMOVED: "REMOVED", TO: "TO",
-               **{t: "UNLINK" for t in UNLINK_TOKENS}}
+               APPEND: "APPEND", **{t: "UNLINK" for t in UNLINK_TOKENS}}
 FL = {name: D.take() for name in dict.fromkeys(FLAG_TOKENS.values())}
 ISACKW, ISACKR, ISNONE, ISMARK, ISSKIP = (D.take() for _ in range(5))
 ACKI, ACKV = D.take(IB), D.take(VB)
@@ -190,10 +202,17 @@ WEND = D.take(S)                   # this token ends a word of 1, 2 or 3 tokens 
 QE = D.take(S + 1)                 # query slot j is empty
 CK, CHK = D.take(NFILE), D.take()  # the file a search checks at this token (one-hot); a check
 QLEN, QV = D.take(S), D.take()     # the query's length (one-hot), a query that can match
-TBIT2 = D.take(VB)                 # the checked file's version, 0/1
-XI, XV = D.take(IB), D.take(VB)    # search features: index, version, form (+-1)
+BCK = D.take(VB)                   # the checked file's base, 0/1
+XI, XV = D.take(IB), D.take(VB)    # search features: index, base, form (+-1)
 XW = [D.take(IDB) for _ in range(S)]
 XT, SFOUND = D.take(), D.take()    # a word's row; the checked file has the word
+# segments: an append call; the base at GO; the read file (one-hot) and its version; a read's
+# segment is not the last; the written text's base (+-1, made at GO and held)
+APP = D.take()
+BGO = D.take(VB)
+RIOH, TRD, MORE = D.take(NFILE), D.take(VB), D.take()
+TRC, RVC = D.take(VB), D.take(VB)  # the read file's version and the read's segment, clean 0/1
+HBS, HB = D.take(VB), D.take(VB)
 assert D.n <= H, D.n
 # features made from layer 2's MLP on, which clears the thermometer U, live in U's dims (the
 # file count one-hot is written by that same MLP: the clear and the write add up)
@@ -519,6 +538,8 @@ def layer2(net):
     d.register(NSLOT + 2, {ONE: 1.0}, [("bit01", {LF[2][0]: 1.0}, L4WD)], tap=-2)
     d.register(NSLOT + 3, {LAG1["LTS"]: 1.0, TSTART: 1.0}, [("bit01", {LAG1["LTS"]: 1.0}, PASTLTS)])
     d.register(NSLOT + 4, {QSTART: 1.0, FL["TCSTART"]: 1.0}, [("bit01", {QSTART: 1.0}, SAWQUERY)])
+    # the call is append_file (its function name token)
+    d.register(NSLOT + 5, {FL["APPEND"]: 1.0, FL["TCSTART"]: 1.0}, [("bit01", {FL["APPEND"]: 1.0}, APP)])
     common(net)
 
 
@@ -558,6 +579,8 @@ def mlp2():
         m.relu(lin, {WEND[k // 2]: 1.0})
     for j in range(S + 1):
         m.match(NAME[j], EMPTYC, down={QE[j]: 1.0})
+    for i in range(NFILE):
+        m.match(RI, i, down={RIOH[i]: 1.0})
     # a search checks file 0 at the newline that opens its response, then file i + 1 at the
     # newline that ends file i's path and at file i's skip
     m.all_of([FL["NL"], LAG1["TRESP"], INCALL, SAWQUERY], {CK[0]: 1.0, CHK: 1.0})
@@ -616,11 +639,19 @@ def layer4(net):
         for r in range(NFILE):
             d.q(h, r, {LIOH[r]: 20.0})
             d.k(h, r, {TK[r]: 20.0})
-    # the version table again, read at the file a search checks
-    h = 1 + NSLOT
-    d.register(h, {}, [("bit01", {ACKV[b]: 0.5, ONE: 0.5}, TBIT2[b]) for b in range(VB)])
+    # the base table: a write ack's version, unless the call appends to a file (an append that
+    # creates one sets it); read at the file a search checks, and at GO (two heads, one table)
+    for h, query, out in ((1 + NSLOT, CK, BCK), (2 + NSLOT, TQ, BGO)):
+        d.register(h, {}, [("bit01", {ACKV[b]: 0.5, ONE: 0.5}, out[b]) for b in range(VB)])
+        for r in range(NFILE):
+            d.q(h, r, {query[r]: 20.0})
+            d.k(h, r, {TK[r]: 20.0})
+        d.beta(h, {ONE: 30.0, APP: -60.0, ISCREATE: 60.0})
+    # the version table again, read at the file being read
+    h = 3 + NSLOT
+    d.register(h, {}, [("bit01", {ACKV[b]: 0.5, ONE: 0.5}, TRD[b]) for b in range(VB)])
     for r in range(NFILE):
-        d.q(h, r, {CK[r]: 20.0})
+        d.q(h, r, {RIOH[r]: 20.0})
         d.k(h, r, {TK[r]: 20.0})
     common(net)
 
@@ -634,10 +665,25 @@ def mlp4():
     rlo, rmid, rhi = sub(RACK)
     top = IDB - IB - VB
     for v in range(1 << VB):
-        m.match(TBIT, v, flags=[GO, FOUND], pm_dims=False,
-                down={**{d: float(c) for d, c in zip(wlo, pm(min(v + 1, (1 << VB) - 1), VB))},
-                      **{d: float(c) for d, c in zip(rlo, pm(v, VB))}})
-    m.relu({GO: 2.0, FOUND: -2.0, ONE: -1.0}, {d: float(c) for d, c in zip(wlo, pm(1, VB))})
+        nxt = {d: float(c) for d, c in zip(wlo, pm(min(v + 1, (1 << VB) - 1), VB))}
+        m.match(TBIT, v, flags=[GO, FOUND], pm_dims=False, down=nxt)
+        # the written text's base: the new version, unless the call appends to the file
+        m.match(TBIT, v, flags=[GO, FOUND], nots=[APP], pm_dims=False,
+                down={h: nxt[w] for h, w in zip(HBS, wlo)})
+        # a read starts at the file's base
+        m.match(BGO, v, flags=[GO, FOUND], pm_dims=False,
+                down={d: float(c) for d, c in zip(rlo, pm(v, VB))})
+    new = {d: float(c) for d, c in zip(wlo, pm(1, VB))}
+    m.relu({GO: 2.0, FOUND: -2.0, ONE: -1.0}, {**new, **{h: new[w] for h, w in zip(HBS, wlo)}})
+    for b in range(VB):
+        m.all_of([BGO[b], GO, FOUND, APP], {HBS[b]: 2.0})
+    m.all_of([GO, FOUND, APP], {h: -1.0 for h in HBS})
+    # the read file's version and the read's segment as clean bits (a register read can be off by
+    # a little in a long prefill; the comparison weighs the high bits by up to 32)
+    for b in range(VB):
+        for x, out in (({TRD[b]: 2.0, ONE: -0.5}, TRC[b]), ({RV[b]: 1.0, ONE: 0.5}, RVC[b])):
+            m.relu(x, {out: 1.0})
+            m.relu({**x, ONE: x[ONE] - 1.0}, {out: -1.0})
     for b in range(IB):
         m.gated(FIDX[b], wmid[b], [GO, FOUND])
         m.gated(FIDX[b], rmid[b], [GO, FOUND])
@@ -665,6 +711,7 @@ def layer5(net):
     d.register(2, {GOS: 1.0}, fields)
     d.register(3, {GOT: 1.0}, [("pm", {FIDX[b]: 1.0}, HDST[b]) for b in range(IB)] +
                [("bit01", {FOUND: 1.0}, HDF)])
+    d.register(4, {GO: 1.0}, [("pm", {HBS[b]: 1.0}, HB[b]) for b in range(VB)])
     common(net)
 
 
@@ -726,6 +773,13 @@ def mlp5():
     ]
     for flags, nots, t in rules:
         m.all_of(flags, codes(OUTC, t), nots=nots)
+    # a read's segment (its last ack's version) is before the file's latest version
+    x = {ONE: 0.0}
+    for b in range(VB):
+        x[TRC[b]] = 2.0 ** b
+        x[RVC[b]] = -(2.0 ** b)
+    m.relu(x, {MORE: 1.0})
+    m.relu({**x, ONE: -1.0}, {MORE: -1.0})
     # list: after a marker (slot n = 0) or a path's n-th token, its next token or a newline
     ls = [LS0] + SLOTRAW
     for n in range(NSLOT):
@@ -810,7 +864,7 @@ def search(m):
     for b in range(IB):
         m.gated_any(HW[VB + b], XI[b], ends)
     for b in range(VB):
-        m.gated_any(HW[b], XV[b], ends)
+        m.gated_any(HB[b], XV[b], ends)
     empty = {d: float(c) for d, c in zip(range(IDB), code(EMPTYC))}
     for b in range(IDB):
         m.gated_any(L1W[0][b], XW[0][b], ends)
@@ -823,7 +877,7 @@ def search(m):
     for k in range(NFILE):
         m.all_of([CK[k], QV], {XI[b]: float(c) for b, c in enumerate(pm(k, IB))})
     for b in range(VB):
-        m.all_of([TBIT2[b], CHK, QV], {XV[b]: 2.0})
+        m.all_of([BCK[b], CHK, QV], {XV[b]: 2.0})
         m.all_of([CHK, QV], {XV[b]: -1.0})
     for n in range(1, S + 1):                      # a query of n tokens
         for r in range(S):
@@ -895,9 +949,26 @@ def mlp6():
     for o, i in zip(OUTC, IDC):
         m.unit({ONE: K}, {o: EPS / K, i: -1 / K}, {i: 1.0})
     swap = {d: EPS * (a - b) for d, a, b in zip(IDC, code(TRESPEND), code(LTS))}
-    s = {o: float(c) for o, c in zip(OUTC, code(LTS))}
-    m.relu({**{o: 4.0 * w for o, w in s.items()}, ONE: -70.0}, swap)    # sum = 18 on a match
-    m.relu({**{o: 4.0 * w for o, w in s.items()}, ONE: -71.0}, {d: -w for d, w in swap.items()})
+    s = {o: 4.0 * float(c) for o, c in zip(OUTC, code(LTS))}       # 72 on a match, <= 64 else
+    m.relu({**s, MORE: -2.0, ONE: -70.0}, swap)
+    m.relu({**s, MORE: -2.0, ONE: -71.0}, {d: -w for d, w in swap.items()})
+    # a segment that is not the last: its "</" becomes the next segment's read ack (the read's
+    # index, its version + 1); g = 1 there, <= -1 everywhere else
+    g = {**s, MORE: 2.0, ONE: -73.0}
+    top = IB + VB
+    m.relu(g, {**{d: -EPS * c for d, c in zip(IDC, code(LTS))},
+               **{d: EPS * c - EPS * c0 for d, c, c0 in
+                  zip(IDC[top:], pm(ACKR0 >> top, IDB - top), code(LTS)[top:])}})
+    for b in range(IB):
+        m.relu({**{k: 2.0 * w for k, w in g.items()}, RI[b]: 1.0, ONE: 2.0 * g[ONE] - 2.0},
+               {IDC[VB + b]: EPS})
+        m.relu({**{k: 2.0 * w for k, w in g.items()}, RI[b]: -1.0, ONE: 2.0 * g[ONE] - 2.0},
+               {IDC[VB + b]: -EPS})
+    for v in range(1 << VB):
+        lin = {r: (1.0 if bit else -1.0) for r, bit in zip(RV, bits(v, VB))}
+        lin.update({k: 2.0 * w for k, w in g.items() if k != ONE})
+        lin[ONE] = 2.0 * g[ONE] - 2.0 - (VB - 1)
+        m.relu(lin, {d: EPS * c for d, c in zip(IDC[:VB], pm(min(v + 1, (1 << VB) - 1), VB))})
     # link listings: the first set bit, then after file i's path the next set bit after i, or
     # the end; with no set bit, "empty"
     out = lambda t: {d: EPS * c for d, c in zip(IDC, code(t))}

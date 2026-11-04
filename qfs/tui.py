@@ -41,6 +41,7 @@ EXAMPLES = [
 ]
 TOOLS = [  # (tool, what it does)
     ("write_file", "save a file (folders: people/alice.txt)"),
+    ("append_file", "add a line to a file"),
     ("read_file", "its text, token for token"),
     ("list_files", "every path"),
     ("link_files", "link a file to another; unlink_files removes it"),
@@ -985,7 +986,8 @@ class QFS(App):
             self.tool = Tool(func, call_arg(func, params), params.get("text"))
             self._add(self.tool)
             arg = call_arg(func, params)
-            fs.doing = {"write_file": f"saving {arg}", "read_file": f"reading {arg}",
+            fs.doing = {"write_file": f"saving {arg}", "append_file": f"adding to {arg}",
+                        "read_file": f"reading {arg}",
                         "list_files": "listing the files", "link_files": f"linking {arg}",
                         "unlink_files": f"unlinking {arg}", "list_links": f"links of {arg}",
                         "list_backlinks": f"backlinks of {arg}",

@@ -4,15 +4,18 @@ rebuild the circuit's rows and tables with the model's own projections.
 Disk layout (DIR):
   index.bin   one record per file: its path (NSLOT token ids, empty slots 0xFFFFFFFF), its index
               I and latest version V
-  files/I.tok the latest version's text as 3-byte token ids (an empty file is a delete)
+  files/I.tok the file's text as 3-byte token ids: its segments, from its last write to V
+  files/I.seg each segment's length in tokens (uint16); the file's base is V minus the
+              segments plus one (no .seg: one segment, an image from before appends)
   links.bin   the links, as (source, target) byte pairs (a set: link and unlink applied)
 
-Only the latest version is kept, so overwrites and deletes free their old text. The image is cut
+Only the current segments are kept, so overwrites and deletes free their old text. The image is cut
 from a session's token log by `compact`, using the write acks the model emitted (they carry I
 and V) and the paths and texts Qwen wrote in its tool calls.
 
 Mounting fills what a fresh session needs from the index: the lookup layer's rows (path -> I),
-the version table (I -> V), the name table (I -> path, for list_files) and the file count; and
+the version and base tables (I -> V, base), the name table (I -> path, for list_files) and the
+file count; and
 from the texts, the search rows: one per distinct word of each file, keyed as at the word's end
 (I, V, its form; the forms come from the model's own embeddings). Everything else starts empty:
 the idle state. Paging a file in, when the model emits its read
@@ -35,8 +38,8 @@ REC = np.dtype([("name", "<u4", F.NSLOT), ("i", "u1"), ("v", "u1")])
 
 
 def writes(toks):
-    """Every write in a session's token log, in order: (I, V, path, text start, text end), the
-    text being toks[start:end]."""
+    """Every write or append in a session's token log, in order: (I, V, path, text start, text
+    end, append), the text being toks[start:end]."""
     out = []
     for p, t in enumerate(toks):
         if not (F.ACKW0 <= t < F.ACKR0):
@@ -49,13 +52,27 @@ def writes(toks):
         ts = after(F.EQTEXT, p)
         te = next(k for k in range(ts, p) if toks[k] == F.NL and toks[k + 1] == F.LTS)
         ns = after(F.EQNAME, ts)
-        out.append((i, v, tuple(toks[ns:toks.index(F.NL, ns)]), ts, te))
+        call = toks[max(k for k in range(ns) if toks[k] == F.TCSTART):ns]
+        out.append((i, v, tuple(toks[ns:toks.index(F.NL, ns)]), ts, te, F.APPEND in call))
     return out
 
 
-def compact(toks):
-    """{I: (path, V, text)} of the latest version of each file, from a session's token log."""
-    return {i: (name, v, toks[ts:te]) for i, v, name, ts, te in writes(toks)}
+def compact(toks, files=None):
+    """{I: (path, V, segments)}: `files` (a mounted image's), then a session's token log: a
+    write starts a file's segments over, an append adds one. A version the image already has
+    is skipped, so the log can be applied again to an image saved from it."""
+    out = dict(files or {})
+    for i, v, name, ts, te, append in writes(toks):
+        if i in out and v <= out[i][1]:
+            continue
+        segs = out[i][2] if append and i in out else []
+        out[i] = (name, v, [*segs, toks[ts:te]])
+    return out
+
+
+def base(v, segs):
+    """A file's base: the version of its first segment."""
+    return v - len(segs) + 1
 
 
 def compact_links(toks, files, links=()):
@@ -88,24 +105,25 @@ def save(files, path, links=()):
     path = Path(path)
     (path / "files").mkdir(parents=True, exist_ok=True)
     recs = np.zeros(len(files), REC)
-    for r, (i, (name, v, body)) in enumerate(sorted(files.items())):
+    for r, (i, (name, v, segs)) in enumerate(sorted(files.items())):
         recs[r]["name"] = list(name) + [NO_TOKEN] * (F.NSLOT - len(name))
         recs[r]["i"], recs[r]["v"] = i, v
-        ids = np.array(body, dtype="<u4")
+        ids = np.array([t for seg in segs for t in seg], dtype="<u4")
         np.stack([ids & 255, ids >> 8 & 255, ids >> 16 & 255], 1).astype(np.uint8).tofile(
             path / "files" / f"{i}.tok")
+        np.array([len(seg) for seg in segs], dtype="<u2").tofile(path / "files" / f"{i}.seg")
     recs.tofile(path / "index.bin")
     np.array(sorted(links), dtype=np.uint8).reshape(-1, 2).tofile(path / "links.bin")
 
 
 def load(path):
-    """A stored image as ({I: (path, V, text)}, links), the form `compact` and `save` use."""
+    """A stored image as ({I: (path, V, segments)}, links), the form `compact` and `save` use."""
     path = Path(path)
     files = {}
     for r in np.fromfile(path / "index.bin", dtype=REC):
         i = int(r["i"])
         name = tuple(int(t) for t in r["name"] if int(t) != NO_TOKEN)
-        files[i] = (name, int(r["v"]), load_tokens(path / "files" / f"{i}.tok")[0])
+        files[i] = (name, int(r["v"]), load_segments(path, i)[0])
     links = np.fromfile(path / "links.bin", dtype=np.uint8).reshape(-1, 2)
     return files, {(int(a), int(b)) for a, b in links.tolist()}
 
@@ -113,6 +131,18 @@ def load(path):
 def load_tokens(f):
     b = np.fromfile(f, dtype=np.uint8).reshape(-1, 3).astype(np.int64)
     return (b[:, 0] | b[:, 1] << 8 | b[:, 2] << 16).tolist(), b.size
+
+
+def load_segments(path, i):
+    """File i's segments (token lists) and its bytes on disk."""
+    toks, nbytes = load_tokens(Path(path) / "files" / f"{i}.tok")
+    seg = Path(path) / "files" / f"{i}.seg"
+    lens = np.fromfile(seg, dtype="<u2").tolist() if seg.exists() else [len(toks)]
+    out, k = [], 0
+    for n in lens:
+        out.append(toks[k:k + n])
+        k += n
+    return out, nbytes
 
 
 def pmv(x, n):
@@ -163,8 +193,8 @@ def search_rows(model, files):
     """Search rows of stored files ({I: (path, V, text)}): one per distinct word of each, with the
     features its end had when the text was written."""
     slots, flags = word_table(model)
-    rows = [(i, v, form) for i, (_, v, body) in sorted(files.items())
-            for form in sorted(set(words.words(body, slots, flags).values()))
+    rows = [(i, base(v, segs), form) for i, (_, v, segs) in sorted(files.items())
+            for form in sorted({f for seg in segs for f in words.words(seg, slots, flags).values()})
             if words.NEVER not in form]
     x = torch.zeros(len(rows), F.H)
     x[:, F.ONE] = 1
@@ -259,11 +289,15 @@ def mount(model, path, dev):
     conv = torch.zeros(1, net.conv_dim, net.conv_kernel_size, dtype=torch.bfloat16, device=dev)
     state = {li: torch.zeros(1, net.num_v_heads, F.DK, F.DK, dtype=torch.float32, device=dev)
              for li, kind in enumerate(F.LAYERS) if kind == "linear_attention"}
+    files, _ = load(path)
     for r in recs:
         i = int(r["i"])
-        row = dual(F.bits(int(r["v"]), F.VB))                     # version table, and its
-        state[TABLE][0, 0, i, :len(row)] = torch.tensor(row)      # copy a search reads
-        state[TABLE][0, 1 + F.NSLOT, i, :len(row)] = torch.tensor(row)
+        row = dual(F.bits(int(r["v"]), F.VB))                     # version table (two heads)
+        state[TABLE][0, 0, i, :len(row)] = torch.tensor(row)
+        state[TABLE][0, 3 + F.NSLOT, i, :len(row)] = torch.tensor(row)
+        b = dual(F.bits(base(int(r["v"]), files[i][2]), F.VB))   # base table (two heads)
+        state[TABLE][0, 1 + F.NSLOT, i, :len(b)] = torch.tensor(b)
+        state[TABLE][0, 2 + F.NSLOT, i, :len(b)] = torch.tensor(b)
         for j, c in enumerate(slot_codes(r)):                     # name table: a head per slot
             vals = dual([(b + 1) // 2 for b in c])
             state[TABLE][0, 1 + j, i, :len(vals)] = torch.tensor(vals)
@@ -282,9 +316,8 @@ def mount(model, path, dev):
         layer.recurrent_states[0].copy_(rec)
         layer.has_previous_state[0] = True
     put(cache, LOOKUP, *lookup_rows(model, recs))
-    files, _ = load(path)
     put(cache, COPY, *search_rows(model, files))      # the copy rows page in on reads
-    return cache, {int(r["i"]): int(r["v"]) for r in recs}
+    return cache, {i: (base(v, segs), v) for i, (_, v, segs) in files.items()}
 
 
 def put(cache, layer, k, v):
@@ -295,30 +328,35 @@ def put(cache, layer, k, v):
 
 
 class Pager:
-    """Pages a stored file's text into the copy layer when the model emits its read ack (a file
-    written in this session is already live)."""
+    """Pages a stored segment's text into the copy layer when the model emits its read ack (a
+    segment written in this session is already live). A read of several segments pages each in
+    at its own ack."""
 
     def __init__(self, model, path, version):
+        """version: {I: (base, V)} of the stored files."""
         self.m, self.path, self.version = model, Path(path), version
         self.loaded, self.load_s, self.load_bytes = set(), 0.0, 0
 
     def __call__(self, cache, tok):
-        """Page in the file `tok` acks, if it is stored and not yet loaded; returns (I, bytes,
+        """Page in the segment `tok` acks, if it is stored and not yet loaded; returns (I, bytes,
         rows) when it paged one."""
         if not (F.ACKR0 <= tok < F.NONE):
             return None
         i, v = (tok - F.ACKR0) >> F.VB, (tok - F.ACKR0) & ((1 << F.VB) - 1)
-        if (i, v) in self.loaded or self.version.get(i) != v:
+        if (i, v) in self.loaded or i not in self.version:
+            return None
+        b, top = self.version[i]
+        if not b <= v <= top:
             return None
         t0 = time.perf_counter()
-        body, nbytes = load_tokens(self.path / "files" / f"{i}.tok")
+        body = load_segments(self.path, i)[0][v - b]
         k, v_ = copy_rows(self.m, i, v, body)
         c = cache.layers[COPY]
         put(cache, COPY, torch.cat([c.keys, k], 2), torch.cat([c.values, v_], 2))
         self.load_s += time.perf_counter() - t0
-        self.load_bytes += nbytes
+        self.load_bytes += 3 * len(body)
         self.loaded.add((i, v))
-        return i, nbytes, k.shape[2]
+        return i, 3 * len(body), k.shape[2]
 
 
 class Session:

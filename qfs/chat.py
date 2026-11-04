@@ -26,6 +26,13 @@ TOOLS = [
             "text": {"type": "string", "description": "the file's text"}},
             "required": ["name", "text"]}}},
     {"type": "function", "function": {
+        "name": "append_file", "description": "Add text to the end of a file, on a new line "
+        "(creates the file if it is missing). Use it to add to a file without writing it again.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "the file path"},
+            "text": {"type": "string", "description": "the text to add"}},
+            "required": ["name", "text"]}}},
+    {"type": "function", "function": {
         "name": "read_file", "description": "Read a saved text file, exactly as it was saved.",
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string", "description": "the file path"}},
@@ -129,7 +136,7 @@ class Chat:
         """Store the filesystem at `path`: the mounted image, if any, with this chat's writes,
         links and unlinks applied. Returns the image's files ({I: (path, V, text)}) and links."""
         files, links = disk.load(self.mounted) if self.mounted else ({}, set())
-        files.update(disk.compact(self.ids))
+        files = disk.compact(self.ids, files)
         links = disk.compact_links(self.ids, files, links)
         disk.save(files, path, links)
         return files, links

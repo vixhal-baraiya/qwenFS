@@ -108,6 +108,7 @@ class Monitor:
                 lit += [3, 4]                      # a write: lookup and the version table
             elif F.ACKR0 <= t < F.NONE:
                 lit += [3, 4, 7]                   # a read: its file found, the copy begins
+                                                   # (or its next segment)
             elif func == "read_file" and t < F.V_QWEN:
                 lit.append(7)                      # copied text
             if t in (F.LINKED, F.REMOVED):

@@ -63,6 +63,10 @@ def main():
         A.write(nm, text(rng, rng.randrange(1, a.maxlen)))
     for nm in rng.sample(stored, max(1, a.files // 8)):
         A.write(nm, [])
+    for nm in rng.sample(stored, a.files // 3):                  # appends, and a long file
+        A.append(nm, text(rng, rng.randrange(1, a.maxlen)))
+    for _ in range(3):
+        A.append(stored[0], text(rng, a.maxlen))
     for _ in range(2 * a.files):
         A.link(rng.choice(stored[:4]), rng.choice(stored))
     for x, y in rng.sample(sorted(A.links, key=str), 3):
@@ -71,19 +75,20 @@ def main():
         pred = model(input_ids=torch.tensor([A.toks], device=dev)).logits[0].argmax(-1).tolist()
     ok = sum(pred[p - 1] == t for p, t in A.forced.items())
     files = disk.compact(A.toks)
-    assert {i: (nm, v) for i, (nm, v, _) in files.items()} == \
-        {i: (nm, v) for nm, (i, v) in A.index.items()}, "compact disagrees with the reference"
+    assert {i: (nm, v, segs) for i, (nm, v, segs) in files.items()} == \
+        {i: (nm, v, A.files[nm]) for nm, (i, v) in A.index.items()}, \
+        "compact disagrees with the reference"
     links = disk.compact_links(A.toks, files)
     idx = {nm: i for nm, (i, _) in A.index.items()}
     assert links == {(idx[x], idx[y]) for x, y in A.links}, "compact_links disagrees"
     disk.save(files, path, links)
     nbytes = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
-    live = sum(len(b) for _, _, b in files.values())
+    live = sum(len(seg) for _, _, segs in files.values() for seg in segs)
     print(f"session A: {len(A.toks)} tokens, forced {ok}/{len(A.forced)} right; disk {nbytes} bytes "
           f"for {len(files)} files, {live} live tokens ({nbytes / max(live, 1):.2f} B/token)")
 
     B = Session(rng)
-    B.index, B.files = dict(A.index), dict(A.files)
+    B.index, B.files = dict(A.index), {nm: list(segs) for nm, segs in A.files.items()}
     B.links = set(A.links)
     B.listing()
     for nm in stored[:4] + missing[:1]:
@@ -94,7 +99,9 @@ def main():
     for nm in order:
         B.read(nm)
     B.write(fresh[0], text(rng, 150))
-    B.write(rng.choice(stored), text(rng, 120))
+    B.write(rng.choice(stored[1:]), text(rng, 120))
+    B.append(stored[0], text(rng, 80))      # a stored file's segments, then one written here
+    B.read(stored[0])
     B.link(fresh[0], stored[0])
     B.link(stored[1], fresh[0])
     B.unlink(*sorted(A.links, key=str)[0])
@@ -141,7 +148,8 @@ def persisted(path, B):
     idx = {nm: i for nm, (i, _) in B.index.items()}
     ok = ({i: (nm, v) for i, (nm, v, _) in files.items()}
           == {i: (nm, v) for nm, (i, v) in B.index.items()}
-          and {i: b for i, (_, _, b) in files.items()} == {idx[nm]: b for nm, b in B.files.items()}
+          and {i: segs for i, (_, _, segs) in files.items()}
+          == {idx[nm]: segs for nm, segs in B.files.items()}
           and links == {(idx[x], idx[y]) for x, y in B.links})
     same = images[0] == images[1]
     print(f"  saved over the mount: {'B' if ok else 'NOT B'}'s filesystem; "

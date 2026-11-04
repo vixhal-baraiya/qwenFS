@@ -18,6 +18,7 @@ from qfs import circuit as F
 from qfs import words as W
 
 TC, LT, FUNCTION, EQ, WRITE, EQREAD, FILE, PARAMETER = 248058, 27, 1628, 28, 4775, 86779, 2378, 15704
+APPEND = F.APPEND
 SKIP = {F.EQNAME, F.EQTEXT, F.EQQUERY}
 
 
@@ -67,14 +68,19 @@ class Session:
             self.forced[len(self.toks)] = t
             self.toks.append(t)
 
-    def write(self, nm, body):
+    def write(self, nm, body, append=False):
+        """write_file, or append_file: a file is its segments since its last write."""
         if nm not in self.index:
             self.index[nm] = (len(self.index), 0)
         i, v = self.index[nm]
         self.index[nm] = (i, v + 1)
-        self.files[nm] = body
+        if append and nm in self.files:
+            self.files[nm].append(body)
+        else:
+            self.files[nm] = [body]
         nl = lambda: F.NL2 if self.rng.random() < 0.3 else F.NL
-        self.toks += call_head([EQ, WRITE, FILE], nm, nl()) + [LT, PARAMETER, F.EQTEXT, F.GT, nl()]
+        func = [EQ, APPEND if append else WRITE, FILE]
+        self.toks += call_head(func, nm, nl()) + [LT, PARAMETER, F.EQTEXT, F.GT, nl()]
         self.toks += body + [F.NL, F.LTS, PARAMETER, F.GT, F.NL] + CALL_TAIL
         self.force(HEAD + [F.ackw(i, v + 1), F.SAVED, F.NL, F.MARK0 + i, *nm, F.NL, F.TRESPEND]
                    + TURN)
@@ -139,8 +145,11 @@ class Session:
         self.toks += CALL_TAIL
         self.respond(len(self.toks), self.listed(nm, "back"))
 
+    def append(self, nm, body):
+        self.write(nm, body, append=True)
+
     def word_forms(self, nm):
-        return set(W.words(self.files[nm], *self.words).values())
+        return {f for seg in self.files[nm] for f in W.words(seg, *self.words).values()}
 
     def search(self, q):
         """search_files with the query's tokens q."""
@@ -159,7 +168,11 @@ class Session:
         start = len(self.toks)
         if nm in self.index:
             i, v = self.index[nm]
-            want = HEAD + [F.ackr(i, v)] + self.files[nm] + [F.NL, F.TRESPEND] + TURN
+            segs = self.files[nm]
+            base = v - len(segs) + 1
+            # each segment after its read ack; the end of all but the last is the next one's ack
+            body = [t for k, seg in enumerate(segs) for t in [F.ackr(i, base + k), *seg, F.NL]]
+            want = HEAD + body + [F.TRESPEND] + TURN
         else:
             want = HEAD + [F.NONE, F.NOT, F.FOUND_, F.NL, F.TRESPEND] + TURN
         self.force(want)
@@ -179,6 +192,15 @@ def make(seed, nfiles, maxlen, misses=3):
         s.write(nm, text(rng, rng.randrange(1, maxlen)))
     for nm in rng.sample(stored, max(1, nfiles // 8)):
         s.write(nm, [])
+    # appends: to files (one after a rewrite, one to an empty file), a long file of five
+    # segments (more than one write holds), and one that creates its file
+    for nm in rng.sample(stored, max(2, nfiles // 3)):
+        for _ in range(rng.randrange(1, 3)):
+            s.append(nm, text(rng, rng.randrange(1, maxlen)))
+    for _ in range(5):
+        s.append(stored[1], text(rng, maxlen))
+    s.append(missing[-1], text(rng, 30))
+    stored = [*stored, missing.pop()]
     s.listing()
     pool = stored + missing[:1]
     for _ in range(2 * nfiles):                    # links (some repeated, some to missing names)
@@ -202,8 +224,9 @@ def make(seed, nfiles, maxlen, misses=3):
 
 
 def searches(rng, s, stored):
-    """Words of current files (one, two and three tokens), words only an older version had, words
-    no file has, too long and empty queries; then a file rewritten and searched again."""
+    """Words of the files (of one, two and three tokens), a word no file has, a query too long, an
+    empty one; words several files share; a word in an appended segment; then a file rewritten
+    and searched for a word of its old text."""
     def form_toks(f):
         return [t for t in reversed(f) if t != W.EMPTY]
 
@@ -224,8 +247,10 @@ def searches(rng, s, stored):
     s.write(shared[-1], text(rng, 30))
     for q in ([57590], [76, 32062], [57590, 76]):     # "Paris", "milk", "Parism"
         s.search(q)
+    s.append(stored[1], [25358, 11])                  # " Tokyo," in an appended segment
+    s.search([51076, 15560])                          # "Tokyo"
     nm = stored[0]
-    if s.files[nm]:
+    if any(s.files[nm]):
         q = form_toks(next(iter(s.word_forms(nm)), (W.EMPTY,) * W.S))
         s.write(nm, text(rng, 20))
         if q:
@@ -243,7 +268,8 @@ def check_prefill(model, s, dev):
 def check_generate(model, s, dev):
     ok = 0
     for start, want in s.reads:
-        out = model(input_ids=torch.tensor([s.toks[:start]], device=dev), use_cache=True)
+        out = model(input_ids=torch.tensor([s.toks[:start]], device=dev), use_cache=True,
+                    logits_to_keep=1)
         cache, got = out.past_key_values, []
         nxt = int(out.logits[0, -1].argmax())
         while len(got) < len(want) + 5:

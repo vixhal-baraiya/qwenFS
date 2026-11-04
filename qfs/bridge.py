@@ -48,7 +48,8 @@ def parse_call(text):
     return (f.group(1) if f else "?"), params
 
 
-CHANGES = {"write_file", "link_files", "unlink_files"}  # the calls that change the filesystem
+# the calls that change the filesystem
+CHANGES = {"write_file", "append_file", "link_files", "unlink_files"}
 
 
 def stored(path):
@@ -87,13 +88,13 @@ class Session:
         self.chat.reset(self.seed, system, mount=mount)
         self.mounted = Path(mount) if mount else None
         self.where = str(self.mounted) if mount else None   # how the panel names the mount
-        self.stored = {}
-        if mount:
-            files, _ = disk.load(mount)
-            self.stored = {i: len(b) for i, (_, _, b) in files.items()}
+        self.image = disk.load(mount)[0] if mount else {}
+        # rows the mount put in the copy layer before any token (the search rows)
+        c = self.chat.cache.layers[disk.COPY]
+        self.mount_rows = c.keys.shape[-2] if getattr(c, "keys", None) is not None else 0
         self.stats = {"turns": 0, "calls": 0, "forced": 0, "tokens": 0, "seconds": 0.0,
                       "paged": 0, "paged_bytes": 0}
-        self.sizes = dict(self.stored)
+        self._sizes()
 
     def path(self, name):
         return self.tok.decode(list(name))
@@ -108,21 +109,24 @@ class Session:
 
     def copy_map(self, live):
         """The copy layer's rows as segments (start, end, kind, I): every token is a row
-        ("context"), a written text's rows hold that file ("file", the latest version, or "old"),
-        and a file paged in from disk adds its rows where it was paged ("paged")."""
-        pages = self.chat.pages
+        ("context"), a written text's rows hold that file ("file", a current segment, or "old"),
+        and a segment paged in from disk adds its rows where it was paged ("paged"). Rows the
+        mount made (the search rows) come first and are left out."""
+        pages, m = self.chat.pages, self.mount_rows
 
         def row(pos):
-            return pos + sum(n for p, n, _ in pages if p <= pos)
+            return m + pos + sum(n for p, n, _ in pages if p <= pos)
 
-        segs, shift = [], 0
+        segs, shift = [], m
         for p, n, i in pages:
             segs.append((p + shift, p + shift + n, "paged", i))
             shift += n
-        for i, v, _, ts, te in disk.writes(self.chat.ids):
+        files = disk.compact(self.chat.ids, self.image)
+        for i, v, _, ts, te, _ in disk.writes(self.chat.ids):
             if te > ts:
-                kind = "file" if live.get(i, (None, -1))[1] == v else "old"
-                segs.append((row(ts), row(te - 1) + 1, kind, i))
+                top = live.get(i, (None, -1))[1]
+                current = i in files and disk.base(*files[i][1:]) <= v <= top
+                segs.append((row(ts), row(te - 1) + 1, "file" if current else "old", i))
         return sorted(segs)
 
     def restore(self):
@@ -245,10 +249,10 @@ class Session:
         return out
 
     def _sizes(self):
-        """Each file's latest text, in tokens: the mounted image's, then this chat's writes."""
-        self.sizes = dict(self.stored)
-        for i, (_, _, b) in disk.compact(self.chat.ids).items():
-            self.sizes[i] = len(b)
+        """Each file's text, in tokens (all its segments): the mounted image's, then this chat's
+        writes and appends."""
+        self.sizes = {i: sum(map(len, segs))
+                      for i, (_, _, segs) in disk.compact(self.chat.ids, self.image).items()}
 
 
 def main():

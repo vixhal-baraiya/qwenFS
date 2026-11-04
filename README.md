@@ -20,6 +20,7 @@ assistant turn, and Qwen answers.
 | Tool | What it does | The circuit's response |
 |---|---|---|
 | `write_file(name, text)` | save a file (replaces it) | `saved` and the path |
+| `append_file(name, text)` | add text to a file, on a new line | `saved` and the path |
 | `read_file(name)` | read a file, token for token | the stored text, or `not found` |
 | `list_files()` | every file | one path per line, or `empty` |
 | `link_files(name, target)` | link a file to another | `linked` and both paths |
@@ -33,7 +34,10 @@ Paths make folders (`people/alice.txt`, `projects/cafe.txt`); links and backlink
 **Where the filesystem lives.** Every part of the model has a job:
 
 - **Attention** holds the files. A write's text stays in the copy layer's attention log, keyed by
-  (file index, version, offset); a read is an exact copy, token by token. A second attention head
+  (file index, version, offset); a read is an exact copy, token by token. Each write or append
+  is a segment, a version of its own: a file is its segments since its last write, and a read
+  copies them in order, printing the next segment's read ack at the end of each one. The ack
+  restarts the offset count, so a file can be far longer than one write. A second attention head
   looks paths up: a path finds its file's index, or falls back to "not found". A third
   searches: every word of a written text is a row, keyed by (file index, version, the word's
   tokens), and a search checks one file per response token, against that file's current
@@ -60,10 +64,11 @@ tokens to the vocabulary. The FS layers clear their dims before Qwen's layers ru
 output code that the tied lm_head reads at the end, so a forced token wins and Qwen's logits are
 untouched everywhere else.
 
-**Disk.** A filesystem saves to a compact image: the paths, the latest text of each file as
-3-byte token ids, and the links (about 3.3–3.8 bytes per stored token). A fresh session mounts
-the image (the tables, the lookup rows and the search rows, one per distinct word of each file)
-and pages a file's text in only when the model emits that file's read ack. Paging rebuilds the copy rows from the token ids with the model's own
+**Disk.** A filesystem saves to a compact image: the paths, each file's current segments as
+3-byte token ids (with their lengths), and the links (about 3.3–3.8 bytes per stored token). A
+fresh session mounts the image (the tables, the lookup rows and the search rows, one per
+distinct word of each file) and pages a segment's text in only when the model emits that
+segment's read ack. Paging rebuilds the copy rows from the token ids with the model's own
 projections. See `qfs/disk.py`.
 
 ## What runs where
@@ -88,7 +93,7 @@ turns):
 
 | | Turns passed | Scenarios passed | Unneeded calls |
 |---|---|---|---|
-| No doc | 49/57 | 17/21 | 42 |
+| No doc | 49/57 | 17/21 | 40 |
 | With the doc | 57/57 | 21/21 | 0 |
 
 Without the doc, the misses are Qwen's calls, not the filesystem's answers: it saved Bob into
@@ -110,8 +115,8 @@ On Qwen3.5-2B, on Apple silicon (MPS, bf16):
 
 ## Limits
 
-- 32 files, paths of up to 8 tokens, about 590 tokens per write, 63 versions per file; a text
-  cannot contain `</`.
+- 32 files, paths of up to 8 tokens, about 590 tokens per write or append, 63 writes and
+  appends per file (so a file can hold about 37,000 tokens); a text cannot contain `</`.
 - Search finds one whole word, exactly and case-sensitively (`Paris`, not `paris`), of up to 3
   tokens as Qwen writes the word alone; longer words are not found.
 - No partial edits: changing a file means writing it again.

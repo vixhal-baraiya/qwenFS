@@ -36,11 +36,15 @@ def call(func, *preds):
     return lambda c: c[0] == func and all(pr(c) for pr in preds)
 
 
+def either(*preds):
+    return lambda c: any(pr(c) for pr in preds)
+
+
 def text_has(*words):
     return lambda c: all(w in c[1].get("text", "").lower() for w in words)
 
 
-W, R, L, U = "write_file", "read_file", "link_files", "unlink_files"
+W, A, R, L, U = "write_file", "append_file", "read_file", "link_files", "unlink_files"
 LF, LL, LB, SF = "list_files", "list_links", "list_backlinks", "search_files"
 NO_LINKS = [call(L), call(U)]
 
@@ -54,10 +58,13 @@ SCENARIOS = {
     "update": [
         ("Save my shopping list at lists/shopping.txt: milk, eggs.",
          [call(W, path("name", "shopping"))], NO_LINKS, [], []),
-        ("Add bread to my shopping list.",
-         [call(W, path("name", "shopping"), text_has("milk", "eggs", "bread"))], NO_LINKS, [], []),
+        ("Add bread to my shopping list.",           # appended, or the whole list written
+         [either(call(A, path("name", "shopping"), text_has("bread")),
+                 call(W, path("name", "shopping"), text_has("milk", "eggs", "bread")))],
+         NO_LINKS, [], []),
         ("What is on my shopping list? Read the file.",
-         [call(R, path("name", "shopping"))], NO_LINKS + [call(W)], ["milk", "eggs", "bread"], []),
+         [call(R, path("name", "shopping"))], NO_LINKS + [call(W), call(A)],
+         ["milk", "eggs", "bread"], []),
     ],
     "organize": [
         ("Remember my friend Alice, a designer in Paris. Save her in the people folder.",
