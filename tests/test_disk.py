@@ -1,7 +1,8 @@
 """The filesystem from disk: session A writes files through tool calls, its image is cut from the log,
 and a fresh session B (empty context) lists, reads, writes and lists again, paging files in when
 the model emits their read acks. B runs one token at a time; every forced token is checked
-against the model's own prediction. The control runs B without paging.
+against the model's own prediction. The control runs B without paging. Last, B's chat is saved
+over the image it mounted (as the app's disk does after every turn), twice.
 
 Usage: python -m tests.test_disk [--seed 0] [--files 12] [--maxlen 300] [--model MERGED]
 """
@@ -11,11 +12,13 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
+from qfs import bridge, disk
 from qfs import circuit as F
-from qfs import disk
+from qfs.chat import Chat
 from tests.test_circuit import Session, names, text
 
 
@@ -111,7 +114,33 @@ def main():
         if paging:
             print(f"    paged {len(sess.loaded)} files: {sess.load_bytes} bytes, rows built in "
                   f"{sess.load_s * 1000:.0f} ms")
+    persisted(path, B)
     shutil.rmtree(path)
+
+
+def persisted(path, B):
+    """B's chat saved over the image it mounted holds B's filesystem, and saving again changes
+    nothing."""
+    chat = SimpleNamespace(mounted=path, ids=B.toks)
+    chat.save = Chat.save.__get__(chat)
+    sess = SimpleNamespace(chat=chat)
+    images = []
+    for _ in range(2):
+        bridge.Session.save(sess, path)
+        assert not path.with_name(path.name + ".new").exists(), "the new image was left beside it"
+        assert not path.with_name(path.name + ".old").exists(), "the old image was left beside it"
+        images.append({f.relative_to(path): f.read_bytes() for f in path.rglob("*")
+                       if f.is_file()})
+    files, links = disk.load(path)
+    idx = {nm: i for nm, (i, _) in B.index.items()}
+    ok = ({i: (nm, v) for i, (nm, v, _) in files.items()}
+          == {i: (nm, v) for nm, (i, v) in B.index.items()}
+          and {i: b for i, (_, _, b) in files.items()} == {idx[nm]: b for nm, b in B.files.items()}
+          and links == {(idx[x], idx[y]) for x, y in B.links})
+    same = images[0] == images[1]
+    print(f"  saved over the mount: {'B' if ok else 'NOT B'}'s filesystem; "
+          f"saved again: {'unchanged' if same else 'CHANGED'}")
+    assert ok and same
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ build:
     uv run hf download Qwen/{{model}} --local-dir models/{{model}}
     uv run python -m qfs.merge models/{{model}} {{merged}}
 
-# chat with Qwen and its filesystem (e.g. just chat --mount fs)
+# chat with Qwen and its filesystem, kept in fs/ (e.g. just chat --disk notes)
 chat *args:
     uv run qfs {{merged}} {{args}}
 

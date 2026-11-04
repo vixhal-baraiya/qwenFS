@@ -12,7 +12,7 @@ from pathlib import Path
 
 from qfs import circuit as F
 from qfs import tui
-from qfs.bridge import Event
+from qfs.bridge import Event, stored
 
 ALICE = "Alice is a designer in Paris."
 
@@ -24,10 +24,11 @@ class FakeSession:
     meta = {"base": "Qwen3.5-2B", "fs_layers": 8, "qwen_layers": 24}
     delay = 0.0
 
-    def __init__(self, merged, device=None, doc=True, mount=None):
+    def __init__(self, merged, device=None, doc=True, mount=None, disk=None):
         self.doc, self.cancel = doc, False
         self.saved = None
-        self.reset(mount)
+        self.disk = Path(disk) if disk else None
+        self.reset(mount or (self.disk if stored(self.disk) else None))
 
     def reset(self, mount=None):
         self.mounted = Path(mount) if mount else None
@@ -51,6 +52,13 @@ class FakeSession:
         self.saved = path
         return {"files": len(self.files), "links": len(self.links), "bytes": 123,
                 "path": str(path)}
+
+    def erase(self):
+        shutil.rmtree(self.disk, ignore_errors=True)
+
+    def _saved(self):
+        if self.disk:
+            yield Event("saved", self.save(self.disk))
 
     def _call(self, func, params, lines, ack, paged=None):
         text = "<tool_call>\n<function=" + func + ">\n" + "".join(
@@ -79,6 +87,7 @@ class FakeSession:
             yield from self._call("write_file", {"name": "people/alice.txt", "text": ALICE},
                                   ["saved", "- people/alice.txt"], {"kind": "write", "i": 0, "v": 1})
             yield from self._say("I saved Alice in **people/alice.txt**.")
+            yield from self._saved()
         elif "cafe" in msg:
             self.files[1] = ("projects/cafe.txt", 1, 6)
             yield from self._call("write_file", {"name": "projects/cafe.txt", "text": "A cafe."},
@@ -89,6 +98,7 @@ class FakeSession:
                                   ["linked", "- people/alice.txt", "to", "- projects/cafe.txt"],
                                   None)
             yield from self._say("Done: Alice is linked to the cafe project.")
+            yield from self._saved()
         elif "read" in msg.lower():
             yield from self._call("read_file", {"name": "people/alice.txt"}, [ALICE],
                                   {"kind": "read", "i": 0, "v": 1}, paged={"i": 0, "bytes": 21})
@@ -129,7 +139,8 @@ def text_of(app):
 async def run(shot=None):
     tui.Session = FakeSession
     tmp = Path(tempfile.mkdtemp(prefix="qfs-tui-"))
-    app = tui.QFS("fake", None)
+    disk = tmp / "disk"
+    app = tui.QFS("fake", None, disk=str(disk))
     checks = []
 
     def check(name, ok):
@@ -141,8 +152,12 @@ async def run(shot=None):
         fs = app.query_one(tui.FSView)
         check("loaded: the prompt is enabled", not app.query_one("#prompt").disabled)
         check("welcome names the checkpoint", "8 layers in front of Qwen's 24" in text_of(app))
+        check("an empty disk: a new filesystem that saves to it",
+              app.session.where is None and f"saves to {disk}/" in text_of(app))
         app.send(tui.EXAMPLES[0])
         await wait_idle(pilot, app)
+        check("a write saves the disk", stored(disk) and app.session.saved == disk
+              and f"saved {disk}" in fs.draw_disk().plain)
         tools = list(app.query(tui.Tool))
         check("a write renders as one tool line", len(tools) == 1 and tools[0].label == "write_file")
         check("its response is under it", "saved" in text_of(app) and "file 0 · version 1" in text_of(app))
@@ -159,18 +174,26 @@ async def run(shot=None):
         check("the hint counts files and links", "2 files" in str(app.query_one("#hint").render())
               and "1 link" in str(app.query_one("#hint").render()))
         app.send("missing file")
+        app.session.saved = None
         await wait_idle(pilot, app)
         check("not found marks the call red", list(app.query(tui.Tool))[-1].state == "err")
+        check("a turn that changes nothing does not save", app.session.saved is None)
+        app.send("/new")
+        await pilot.pause(0.2)
+        check("/new starts a new chat on your files", app.session.where == str(disk)
+              and app.query(".welcome"))
         app.send("/help")
         await pilot.pause(0.2)
         check("/help lists the commands", "/mount" in text_of(app))
         app.send(f"/save {tmp}")
         await pilot.pause(0.2)
-        check("/save stores it", app.session.saved == tmp and "saved" in fs.draw_disk().plain)
+        check("/save stores a copy", app.session.saved == tmp and app.session.disk == disk
+              and "saved" in fs.draw_disk().plain)
         app.send(f"/mount {tmp}")
         await pilot.pause(0.3)
-        check("/mount starts a new chat on it", app.session.where == str(tmp)
-              and app.query(".welcome") and "mounted" in fs.draw_disk().plain)
+        check("/mount starts a new chat on it, now the disk", app.session.where == str(tmp)
+              and app.session.disk == tmp and app.query(".welcome")
+              and "mounted" in fs.draw_disk().plain)
         app.send(f"/mount {tmp}/nothing")
         await pilot.pause(0.2)
         check("/mount of a missing image says so", "No filesystem" in text_of(app))
@@ -192,6 +215,10 @@ async def run(shot=None):
         await pilot.press("escape")
         await wait_idle(pilot, app)
         check("escape interrupts, the files kept", not app.busy and "kept" in text_of(app))
+        app.send("/format")
+        await pilot.pause(0.2)
+        check("/format erases the disk", not stored(tmp) and app.session.where is None
+              and not fs.state["files"] and "Erased" in text_of(app))
         # a narrow window hides the panel
         await pilot.resize_terminal(80, 40)
         await pilot.pause(0.2)
@@ -207,6 +234,14 @@ async def run(shot=None):
                 await wait_idle(pilot, app)
             app.save_screenshot(shot)
             print(f"  screenshot: {shot}")
+    # a new app on a stored disk starts on it; --no-disk keeps the filesystem in memory
+    tui.Session(None, disk=None).save(disk)
+    for d, want in ((disk, str(disk)), (None, None)):
+        app = tui.QFS("fake", None, disk=str(d) if d else None)
+        async with app.run_test(size=(150, 46)) as pilot:
+            await wait_idle(pilot, app)
+            check(f"a new app {'starts on the disk' if d else 'without a disk starts empty'}",
+                  app.session.where == want)
     shutil.rmtree(tmp, ignore_errors=True)
     bad = [n for n, ok in checks if not ok]
     print(f"{len(checks) - len(bad)}/{len(checks)} checks passed")

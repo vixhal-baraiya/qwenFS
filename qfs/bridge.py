@@ -8,6 +8,7 @@
   response  the circuit's tool response, once printed: its lines, the file it acked, and the
             file paged in from disk for it, if any
   fs        the filesystem as the model now holds it, read from its state (qfs.monitor.read)
+  saved     the filesystem stored to the session's disk, after a turn that changed it
   done      the turn's end
 The loop decodes only: every response token is the model's own prediction.
 
@@ -15,6 +16,7 @@ Run: uv run python -m qfs.bridge MERGED "Save notes/todo.txt: call the dentist"
 """
 import json
 import re
+import shutil
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -46,8 +48,19 @@ def parse_call(text):
     return (f.group(1) if f else "?"), params
 
 
+CHANGES = {"write_file", "link_files", "unlink_files"}  # the calls that change the filesystem
+
+
+def stored(path):
+    """Whether `path` holds a filesystem image."""
+    return path is not None and (Path(path) / "index.bin").exists()
+
+
 class Session:
-    def __init__(self, merged, device=None, doc=True, temp=0.7, seed=0, mount=None):
+    """With a `disk`, the filesystem persists: the session starts on the image stored there (if
+    any), saves to it after every turn that changed the filesystem, and an interrupt keeps it."""
+
+    def __init__(self, merged, device=None, doc=True, temp=0.7, seed=0, mount=None, disk=None):
         self.dev = device or ("cuda" if torch.cuda.is_available() else
                               "mps" if torch.backends.mps.is_available() else "cpu")
         self.merged = Path(merged)
@@ -64,7 +77,8 @@ class Session:
         self.tok = self.chat.tok
         self.cancel = False
         self.seed = seed
-        self.reset(mount)
+        self.disk = Path(disk) if disk else None
+        self.reset(mount or (self.disk if stored(self.disk) else None))
 
     # the filesystem -------------------------------------------------------------------------
     def reset(self, mount=None):
@@ -113,19 +127,36 @@ class Session:
 
     def restore(self):
         """After an interrupt: a new chat on the files so far (the context is cleared, the
-        filesystem is kept), through a stored image."""
+        filesystem is kept), through a stored image: the disk's, or a temporary one."""
         import tempfile
 
-        tmp = Path(tempfile.mkdtemp(prefix="qfs-"))
-        self.chat.save(tmp)
+        path = self.disk or Path(tempfile.mkdtemp(prefix="qfs-"))
+        self.save(path)
         stats = self.stats
-        self.reset(tmp)
+        self.reset(path)
         self.stats = stats
-        self.where = "your files, kept after the interrupt"
+        if not self.disk:
+            self.where = "your files, kept after the interrupt"
+
+    def erase(self):
+        """Erase the disk's image (the chat goes on until the next reset)."""
+        if self.disk:
+            shutil.rmtree(self.disk, ignore_errors=True)
 
     def save(self, path):
-        files, links = self.chat.save(path)
-        nbytes = sum(f.stat().st_size for f in Path(path).rglob("*") if f.is_file())
+        """Store the filesystem at `path`, replacing any image there in one step: it is written
+        beside it first, so an interrupted save leaves the old image whole. `path` may be the
+        mounted image itself (the chat's writes are applied to it)."""
+        path = Path(path)
+        tmp, old = path.with_name(path.name + ".new"), path.with_name(path.name + ".old")
+        shutil.rmtree(tmp, ignore_errors=True)
+        files, links = self.chat.save(tmp)
+        shutil.rmtree(old, ignore_errors=True)
+        if path.exists():
+            path.rename(old)
+        tmp.rename(path)
+        shutil.rmtree(old, ignore_errors=True)
+        nbytes = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
         return {"files": len(files), "links": len(links), "bytes": nbytes, "path": str(path)}
 
     # a turn ---------------------------------------------------------------------------------
@@ -134,7 +165,7 @@ class Session:
         t0 = time.time()
         phase, func, seg, said = "qwen", None, [], ""
         body, call_text, n = None, "", 0
-        paged = None
+        paged, changed = None, False
         for t in self.chat.stream(user):
             if self.cancel and phase in ("qwen", "call"):   # never inside a response
                 self.restore()
@@ -168,6 +199,7 @@ class Session:
                 body = []
             elif t == F.TRESPEND:
                 yield Event("response", self._response(func, body or [], paged))
+                changed |= func in CHANGES
                 if paged:
                     self.stats["paged"] += 1
                     self.stats["paged_bytes"] += paged[1]
@@ -182,6 +214,8 @@ class Session:
                 phase, func = "qwen", None             # the new assistant turn's text
         self._sizes()
         yield Event("fs", self.state())
+        if changed and self.disk:
+            yield Event("saved", self.save(self.disk))
         self.stats["turns"] += 1
         self.stats["tokens"] += n
         self.stats["seconds"] += time.time() - t0

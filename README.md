@@ -126,8 +126,10 @@ just chat
 chat app: each tool call shows as one line with the circuit's response under it, and the panel
 on the right is the filesystem as the model holds it, decoded from its DeltaNet state after
 every response: the files and folders, the links, the FS layers lighting up as they act, and
-the disk. `/save` stores the filesystem (in `fs/` by default) and `/mount` starts a new chat on
-a stored one, whose files page in when Qwen reads them; `/help` lists the rest.
+the disk. The filesystem persists in `fs/`: the app starts on it, and saves to it after every
+turn that changes it, so your files are there in the next chat. A stored file pages in only when
+Qwen reads it. `/new` starts a new chat on your files, `/format` erases them, `--disk DIR` keeps
+them elsewhere and `--no-disk` keeps them in memory only; `/help` lists the rest.
 
 `just ask "Save notes/todo.txt: call the dentist" "What's on my todo list?"` sends messages
 without the app. `just` lists every recipe: `test` (the circuit alone, no Qwen needed),

@@ -6,7 +6,10 @@ are slash commands typed in the input (/help lists them). The panel on the right
 filesystem as the model holds it, read from its state after every response (qfs/monitor.py):
 its files and folders, its links, the FS layers lighting up as they act, and the disk.
 
-Run: uv run qfs [MERGED] [--device mps] [--mount DIR] [--no-doc]
+The filesystem persists on a disk (fs/ by default): the app starts on it and saves to it after
+every turn that changes it.
+
+Run: uv run qfs [MERGED] [--device mps] [--disk DIR | --no-disk] [--no-doc]
 """
 
 import time
@@ -25,7 +28,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Input, Static
 
 from qfs import circuit as F
-from qfs.bridge import Cancelled, Event, Session
+from qfs.bridge import Cancelled, Event, Session, stored
 from qfs.monitor import LAYERS, Monitor
 
 EXAMPLES = [
@@ -42,11 +45,12 @@ TOOLS = [  # (tool, what it does)
     ("link_files", "link a file to another; unlink_files removes it"),
     ("list_links", "a file's links; list_backlinks: the files linking to it"),
 ]
-DISK = "fs"  # where /save and /mount keep the filesystem by default
+DISK = "fs"  # where the filesystem persists by default
 COMMANDS = [  # (command, arguments, what it does)
-    ("/save", "[dir]", f"store the filesystem on disk (default {DISK}/)"),
-    ("/mount", "[dir]", "a new chat on a stored filesystem"),
-    ("/new", "", "a new chat on an empty filesystem"),
+    ("/save", "dir", "store a copy of the filesystem in dir"),
+    ("/mount", "dir", "a new chat on the filesystem stored in dir, now the disk"),
+    ("/new", "", "a new chat on your files"),
+    ("/format", "", "erase the disk: a new chat on an empty filesystem"),
     ("/doc", "on|off", "the filesystem reference as Qwen's system prompt"),
     ("/panel", "", "show or hide the filesystem panel"),
     ("/help", "", "commands and keys"),
@@ -651,9 +655,9 @@ class QFS(App):
     ]
 
     def __init__(self, merged: str, device: str | None, doc: bool = True,
-                 mount: str | None = None):
+                 disk: str | None = DISK):
         super().__init__()
-        self.merged, self.device, self.doc, self.mount_dir = merged, device, doc, mount
+        self.merged, self.device, self.doc, self.disk = merged, device, doc, disk
         self.session: Session | None = None
         self.busy, self.t0 = True, time.time()
         self.status_text = "Loading the model"
@@ -694,9 +698,12 @@ class QFS(App):
         rows = [Horizontal(Static(name, classes="row-name"), Static(Text(what, style="dim")),
                            classes="row")
                 for name, what in TOOLS]
-        mount = self.session.where if self.session else None
+        s = self.session
+        mount = s.where if s else None
+        disk = s.disk if s else None
         where = (f"on {mount}" if mount else
-                 "on an empty filesystem · /save stores it, /mount loads it")
+                 f"on an empty filesystem · it saves to {disk}/" if disk else
+                 "on an empty filesystem, kept in memory only · /save stores it")
         foot = Static(Text(f"\nA new chat {where}\n/ for commands · esc stops · ctrl+b panel",
                            style="dim"))
         return Vertical(Static(intro), *[Example(e) for e in EXAMPLES], Static(tools), *rows,
@@ -761,7 +768,7 @@ class QFS(App):
 
         transformers.logging.set_verbosity_error()  # its warnings would draw over the screen
         try:
-            s = Session(self.merged, self.device, doc=self.doc, mount=self.mount_dir)
+            s = Session(self.merged, self.device, doc=self.doc, disk=self.disk)
         except Exception as e:  # noqa: BLE001 - shown in the app
             self.call_from_thread(self._loaded, None, str(e))
             return
@@ -881,10 +888,10 @@ class QFS(App):
 
         hits = [c for c, _, _ in COMMANDS if c.startswith(name)]
         name = hits[0] if len(hits) == 1 else name
-        if self.busy and name in ("/save", "/mount", "/new", "/doc"):
+        if self.busy and name in ("/save", "/mount", "/new", "/format", "/doc"):
             reply("Still working: press escape first.", True)
         elif name == "/save":
-            path = Path(arg or DISK)
+            path = Path(arg) if arg else s.disk or Path(DISK)
             try:
                 r = s.save(path)
             except OSError as e:
@@ -896,10 +903,11 @@ class QFS(App):
                       f"link{'s' * (r['links'] != 1)} to {path}/ "
                       f"({size(r['bytes'])}).")
         elif name == "/mount":
-            path = Path(arg or DISK)
-            if not (path / "index.bin").exists():
+            path = Path(arg) if arg else s.disk or Path(DISK)
+            if not stored(path):
                 reply(f"No filesystem in {path}/: /save stores one.", True)
             else:
+                s.disk = s.disk and path  # the disk follows the mount; no disk stays none
                 self.action_new_chat(mount=path)
                 fs = self.query_one(FSView)
                 n = len(fs.state["files"])
@@ -912,11 +920,16 @@ class QFS(App):
                 reply("Usage: /doc on|off", True)
             else:
                 s.doc = v
-                self.action_new_chat(mount=s.mounted)
+                self.action_new_chat()
                 reply(f"The filesystem reference: {'on' if v else 'off'}. A new chat"
                       + (f" on {s.mounted}/." if s.mounted else "."))
         elif name == "/new":
             self.action_new_chat()
+        elif name == "/format":
+            s.erase()
+            self.action_new_chat(mount=None)
+            reply("Erased" + (f" {s.disk}/" if s.disk else " the filesystem")
+                  + ": a new chat on an empty filesystem.")
         elif name == "/panel":
             self.action_toggle_side()
         elif name == "/help":
@@ -997,6 +1010,8 @@ class QFS(App):
         elif e.kind == "fs":
             fs.update_fs(d)
             self._hint()
+        elif e.kind == "saved":
+            fs.disk["saved"] = d
         elif e.kind == "cut":
             self._add(Notice(Text("The turn reached the token limit.", style=ERR)))
         elif e.kind == "done":
@@ -1017,16 +1032,23 @@ class QFS(App):
 
     def _failed(self, err: str) -> None:
         self._busy(False)
-        self._add(Notice(Text(f"Error: {err}. Started a new chat.", style=ERR)))
-        self.session.reset()
+        self._add(Notice(Text(f"Error: {err}. Started a new chat on the last saved files.",
+                              style=ERR)))
+        self.session.reset(self._home())
         self._new_fs()
         self._hint()
 
+    def _home(self) -> Path | None:
+        """The image a new chat starts on: the disk's, else the one mounted (if any)."""
+        s = self.session
+        return s.disk if stored(s.disk) else s.mounted
+
     # actions --------------------------------------------------------------------------------
-    def action_new_chat(self, mount=None) -> None:
+    def action_new_chat(self, mount: Path | None | bool = True) -> None:
+        """A new chat on `mount`: by default, on your files."""
         if self.session is None or self.busy:
             return
-        self.session.reset(mount)
+        self.session.reset(self._home() if mount is True else mount)
         self.tool = self.answer = self.draft = None
         self._new_fs()
         chat = self.query_one("#chat")
@@ -1072,7 +1094,11 @@ def main() -> None:
                                              "filesystem inside its weights")
     ap.add_argument("merged", nargs="?", default="build/fs-qwen-2b")
     ap.add_argument("--device", help="cuda, mps or cpu (default: the fastest available)")
-    ap.add_argument("--mount", help="start on the filesystem stored in this directory")
+    ap.add_argument("--disk", default=DISK,
+                    help=f"where the filesystem persists (default {DISK}/): the app starts on it "
+                         "and saves to it after every turn that changes it")
+    ap.add_argument("--no-disk", action="store_true",
+                    help="keep the filesystem in memory only (/save still stores a copy)")
     ap.add_argument("--no-doc", action="store_true",
                     help="without the filesystem reference as the system prompt")
     a = ap.parse_args()
@@ -1082,7 +1108,7 @@ def main() -> None:
     from multiprocessing import resource_tracker
 
     resource_tracker.ensure_running()
-    QFS(a.merged, a.device, not a.no_doc, a.mount).run()
+    QFS(a.merged, a.device, not a.no_doc, None if a.no_disk else a.disk).run()
 
 
 if __name__ == "__main__":
