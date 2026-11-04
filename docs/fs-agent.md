@@ -32,7 +32,7 @@ A missing file gives "not found".
 - To remove one link, unlink exactly that pair; the other links stay.
 - To find files by what they say, search one word, spelled as in the files: search_files
   matches whole words exactly, and capitals count (Berlin, not berlin).
-- Limits: 32 files; about 500 words per write_file or append_file call. A file can grow past
+- Limits: 128 files; about 500 words per write_file or append_file call. A file can grow past
   that through appends, up to 63 writes and appends in all.
 
 ## Examples

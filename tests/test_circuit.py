@@ -7,6 +7,7 @@ checked: in one prefill, and by greedy decoding with the cache from each read's 
 Searches are checked against qfs.words, the rule in Python.
 
 Usage: python -m tests.test_circuit [--seed 0] [--files 10] [--maxlen 300] [--model MERGED]
+       python -m tests.test_circuit --full       (all 128 files, short texts)
 """
 import argparse
 import random
@@ -110,8 +111,12 @@ class Session:
         self.toks += self.param(F.EQNAME, nm) + self.param(F.EQTARGET, target) + CALL_TAIL
         start = len(self.toks)
         if nm in self.index and target in self.index:
-            (self.links.discard if unlink else self.links.add)((nm, target))
-            body = [F.REMOVED if unlink else F.LINKED, F.NL, F.MARK0 + self.index[nm][0], *nm,
+            pair = (nm, target)
+            # a call that changes nothing prints the no-op variant of its word
+            word = ((F.REMOVED if pair in self.links else F.REMOVEDN) if unlink else
+                    (F.LINKEDN if pair in self.links else F.LINKED))
+            (self.links.discard if unlink else self.links.add)(pair)
+            body = [word, F.NL, F.MARK0 + self.index[nm][0], *nm,
                     F.NL, F.TO, F.NL, F.MARK0 + self.index[target][0], *target, F.NL]
         else:
             body = [F.NONE, F.NOT, F.FOUND_, F.NL]
@@ -127,13 +132,15 @@ class Session:
         self.toks += text(self.rng, self.rng.randrange(1, 10))
 
     def listed(self, nm, which):
+        """A link listing: every file in order, a marker and its path if linked, else a skip."""
         if nm not in self.index:
             return [F.NONE, F.NOT, F.FOUND_, F.NL]
-        other = sorted({b for a, b in self.links if a == nm} if which == "links" else
-                       {a for a, b in self.links if b == nm}, key=lambda x: self.index[x][0])
-        if not other:
-            return [F.EMPTYW, F.NL]
-        return [t for x in other for t in [F.MARK0 + self.index[x][0], *x, F.NL]]
+        other = ({b for a, b in self.links if a == nm} if which == "links" else
+                 {a for a, b in self.links if b == nm})
+        body = []
+        for x, (i, _) in sorted(self.index.items(), key=lambda kv: kv[1][0]):
+            body += [F.MARK0 + i, *x, F.NL] if x in other else [F.SKIP0 + i]
+        return body if other else body + [F.EMPTYW, F.NL]
 
     def list_links(self, nm):
         self.toks += [TC, F.NL, LT, FUNCTION, EQ, 1003, F.GT, F.NL] + self.param(F.EQFILE, nm)
@@ -257,6 +264,39 @@ def searches(rng, s, stored):
             s.search(q)                    # the old text had it: not found unless the new one has
 
 
+def make_full(seed):
+    """Every file index in use, with short texts: a listing of all of them, reads, links and
+    link listings, and searches at the first and last indices, a rewrite and an append."""
+    rng = random.Random(seed)
+    s = Session(rng)
+    nms = names(rng, F.NFILE + 1)
+    stored, missing = nms[:F.NFILE], nms[F.NFILE]
+    paris = [11751, 11]                                   # " Paris,"
+    for i, nm in enumerate(stored):
+        body = text(rng, rng.randrange(2, 6))
+        s.write(nm, body + paris + text(rng, 2) if i in (0, 63, 100, F.NFILE - 1) else body)
+    s.listing()
+    last = stored[-1]
+    for nm in (stored[0], stored[1], stored[64], stored[-2], last, missing):
+        s.read(nm)
+    for a, b in ((last, stored[0]), (stored[0], last), (stored[100], last), (last, last),
+                 (stored[5], stored[100]), (last, stored[0])):
+        s.link(a, b)
+    s.unlink(stored[0], last)
+    s.unlink(stored[1], stored[2])                        # never linked: a no-op
+    for nm in (last, stored[5]):
+        s.list_links(nm)
+    for nm in (last, stored[0]):
+        s.list_backlinks(nm)
+    s.search([57590])                                     # "Paris"
+    s.write(last, text(rng, 4))
+    s.append(stored[-2], paris)
+    for nm in (last, stored[-2]):
+        s.read(nm)
+    s.search([57590])
+    return s
+
+
 @torch.no_grad()
 def check_prefill(model, s, dev):
     pred = model(input_ids=torch.tensor([s.toks], device=dev)).logits[0].argmax(-1).tolist()
@@ -279,6 +319,9 @@ def check_generate(model, s, dev):
             out = model(input_ids=torch.tensor([[nxt]], device=dev), past_key_values=cache,
                         use_cache=True)
             cache, nxt = out.past_key_values, int(out.logits[0, -1].argmax())
+        del out, cache                     # each read re-runs its prefix: free the last one's
+        if dev == "mps":
+            torch.mps.empty_cache()
         if got == want:
             ok += 1
         else:
@@ -297,6 +340,7 @@ def main():
     ap.add_argument("--maxlen", type=int, default=300)
     ap.add_argument("--model", help="a merged checkpoint instead of the standalone circuit")
     ap.add_argument("--no-generate", action="store_true")
+    ap.add_argument("--full", action="store_true", help="all 128 files, short texts")
     a = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "mps"
     t0 = time.time()
@@ -307,7 +351,7 @@ def main():
         model = F.build(dev, F.calibrate(dev), W.table(W.tokenizer(), F.VOCAB))
     print(f"model ready in {time.time() - t0:.0f}s")
     Session.words = W.table(W.tokenizer(a.model), F.VOCAB)
-    s = make(a.seed, a.files, a.maxlen)
+    s = make_full(a.seed) if a.full else make(a.seed, a.files, a.maxlen)
     print(f"session: {len(s.toks)} tokens, {len(s.reads)} reads, {len(s.forced)} forced tokens")
     good, total, bad = check_prefill(model, s, dev)
     print(f"prefill:  {good}/{total} forced tokens right" + (f", first wrong at {bad}" if bad else ""))

@@ -229,6 +229,7 @@ class Session:
         """A response's text as Qwen reads it (a marker reads as "-"; a skip as a newline, so it
         is left out), and its ack."""
         ack, pieces = None, [[]]
+        body = [{F.LINKEDN: F.LINKED, F.REMOVEDN: F.REMOVED}.get(t, t) for t in body]
         for t in body:
             if F.ACKW0 <= t < F.NONE:
                 x = t - (F.ACKW0 if t < F.ACKR0 else F.ACKR0)

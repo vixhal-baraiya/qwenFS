@@ -14,8 +14,8 @@ from a session's token log by `compact`, using the write acks the model emitted 
 and V) and the paths and texts Qwen wrote in its tool calls.
 
 Mounting fills what a fresh session needs from the index: the lookup layer's rows (path -> I),
-the version and base tables (I -> V, base), the name table (I -> path, for list_files) and the
-file count; and
+the version and base tables (I -> V, base), the name table (I -> path, for list_files), the
+file count, the seek layer's link rows (one per link); and
 from the texts, the search rows: one per distinct word of each file, keyed as at the word's end
 (I, V, its form; the forms come from the model's own embeddings). Everything else starts empty:
 the idle state. Paging a file in, when the model emits its read
@@ -32,7 +32,7 @@ from transformers.cache_utils import DynamicCache
 from qfs import circuit as F
 from qfs import words
 
-LOOKUP, PAIR, COPY, TABLE, COUNTL = F.LOOKUP, F.PAIR, F.COPY, F.TABLE, F.COUNTL
+LOOKUP, SEEK, COPY, TABLE, COUNTL = F.LOOKUP, F.SEEK, F.COPY, F.TABLE, F.COUNTL
 NO_TOKEN = 0xFFFFFFFF
 REC = np.dtype([("name", "<u4", F.NSLOT), ("i", "u1"), ("v", "u1")])
 
@@ -91,7 +91,7 @@ def compact_links(toks, files, links=()):
             k = call.index(eq) + 3
             return tuple(call[k:call.index(F.NL, k)])
         end = toks.index(F.TRESPEND, b)
-        if F.LINKED not in toks[b:end] and F.REMOVED not in toks[b:end]:
+        if not {F.LINKED, F.REMOVED, F.LINKEDN, F.REMOVEDN} & set(toks[b:end]):
             continue
         pair = (index[path(F.EQNAME)], index[path(F.EQTARGET)])
         if any(t in call for t in F.UNLINK_TOKENS):
@@ -189,22 +189,26 @@ def word_table(model):
     return model._qfs_words
 
 
-def search_rows(model, files):
-    """Search rows of stored files ({I: (path, V, text)}): one per distinct word of each, with the
-    features its end had when the text was written."""
+def seek_rows(model, files, links):
+    """Seek-layer rows of a stored image: a search row per distinct word of each file, with the
+    features its end had when the text was written, and a link row (+1) per link."""
     slots, flags = word_table(model)
     rows = [(i, base(v, segs), form) for i, (_, v, segs) in sorted(files.items())
             for form in sorted({f for seg in segs for f in words.words(seg, slots, flags).values()})
             if words.NEVER not in form]
-    x = torch.zeros(len(rows), F.H)
+    links = sorted(links)
+    x = torch.zeros(len(rows) + len(links), F.H)
     x[:, F.ONE] = 1
-    x[:, F.XT] = 1
     for n, (i, v, form) in enumerate(rows):
+        x[n, F.XT] = 1
         x[n, F.XI] = pmv(i, F.IB)
         x[n, F.XV] = pmv(v, F.VB)
         for r in range(F.S):
             x[n, F.XW[r]] = pmv(form[r], F.IDB)
-    return kv(model.model.layers[COPY].self_attn, x)
+    for n, (a, b) in enumerate(links, len(rows)):
+        x[n, F.LT], x[n, F.LV] = 1, 1
+        x[n, F.LS], x[n, F.LD] = pmv(a, F.IB), pmv(b, F.IB)
+    return kv(model.model.layers[SEEK].self_attn, x)
 
 
 def lookup_rows(model, recs):
@@ -242,7 +246,8 @@ class FSCache(DynamicCache):
                          if types[i] == "full_attention"), None)
 
     def _at(self, layer_idx):
-        return self.pos if self.pos is not None and layer_idx in (0, LOOKUP, COPY) else layer_idx
+        return (self.pos if self.pos is not None and layer_idx in (0, LOOKUP, SEEK, COPY)
+                else layer_idx)
 
     def get_seq_length(self, layer_idx=0):
         return super().get_seq_length(self._at(layer_idx))
@@ -272,7 +277,7 @@ def attach(model):
             return args, kw
         return pre
 
-    for li in (LOOKUP, COPY):
+    for li in (LOOKUP, SEEK, COPY):
         model.model.layers[li].self_attn.register_forward_pre_hook(hook(li), with_kwargs=True)
     model._qfs_masks = True
 
@@ -289,7 +294,7 @@ def mount(model, path, dev):
     conv = torch.zeros(1, net.conv_dim, net.conv_kernel_size, dtype=torch.bfloat16, device=dev)
     state = {li: torch.zeros(1, net.num_v_heads, F.DK, F.DK, dtype=torch.float32, device=dev)
              for li, kind in enumerate(F.LAYERS) if kind == "linear_attention"}
-    files, _ = load(path)
+    files, links = load(path)
     for r in recs:
         i = int(r["i"])
         row = dual(F.bits(int(r["v"]), F.VB))                     # version table (two heads)
@@ -301,13 +306,8 @@ def mount(model, path, dev):
         for j, c in enumerate(slot_codes(r)):                     # name table: a head per slot
             vals = dual([(b + 1) // 2 for b in c])
             state[TABLE][0, 1 + j, i, :len(vals)] = torch.tensor(vals)
-    links = np.fromfile(path / "links.bin", dtype=np.uint8).reshape(-1, 2)
-    for s_, d_ in links.tolist():                                  # link bits
-        r = (s_ % 4) * F.NFILE + d_
-        state[PAIR][0, s_ // 4, r, d_] = 20.0                      # the target's column
-        state[PAIR][0, 8 + s_ // 4, r, s_] = 20.0                  # the source's column
     if recs.size:                                                  # file count
-        row = dual(F.bits(len(recs), F.IB))
+        row = dual(F.bits(len(recs), F.CB))
         state[COUNTL][0, F.NSLOT + 1, 0, :len(row)] = torch.tensor(row)
     for li, rec in state.items():
         layer = cache.layers[li]
@@ -316,7 +316,10 @@ def mount(model, path, dev):
         layer.recurrent_states[0].copy_(rec)
         layer.has_previous_state[0] = True
     put(cache, LOOKUP, *lookup_rows(model, recs))
-    put(cache, COPY, *search_rows(model, files))      # the copy rows page in on reads
+    put(cache, SEEK, *seek_rows(model, files, links))
+    n_kv = model.model.layers[COPY].self_attn.k_proj.out_features // F.HD
+    empty = torch.zeros(1, n_kv, 0, F.HD, dtype=torch.bfloat16, device=dev)
+    put(cache, COPY, empty, empty)                    # the copy rows page in on reads
     return cache, {i: (base(v, segs), v) for i, (_, v, segs) in files.items()}
 
 

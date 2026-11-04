@@ -102,6 +102,9 @@ def merge(src, xs, gain):
         E[F.MARK0:F.MARK0 + F.NFILE, :d0] = (ALIAS * E[F.DASH, :d0].float()).to(E.dtype)
         # search skips look like a newline, as acks do
         E[F.SKIP0:F.SKIP0 + F.NFILE, :d0] = (ALIAS * E[F.NL, :d0].float()).to(E.dtype)
+        # a link call's no-op words look like "linked" / "removed"
+        for t, word in ((F.LINKEDN, F.LINKED), (F.REMOVEDN, F.REMOVED)):
+            E[t, :d0] = (ALIAS * E[word, :d0].float()).to(E.dtype)
         F.fill(model.model.layers[:len(FS_LAYERS)], xs)
         F.code_gain(model.model.norm, gain)
     model.tie_weights()

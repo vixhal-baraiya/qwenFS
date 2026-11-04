@@ -29,8 +29,9 @@ Responses look like
 
 Acks ([w I V], [r I V], [none]), list markers ([m I]) and skips ([s I]) are FS tokens: they
 carry a file's index and version into the circuit's state. To Qwen's layers an ack or a skip
-reads as a newline and a marker as "-". A search goes through the files in order, printing a
-marker and the path of each file that has the word and a skip for each that does not.
+reads as a newline and a marker as "-". A search or a link listing goes through the files in
+order, printing a marker and the path of each file that matches and a skip for each that does
+not.
 
 How a call is read. The circuit keys on single tokens that Qwen's tool-call format always uses:
 "=name", "=text", "=target", "=file", "=path", "=query", ">", newline, "</", <tool_call>,
@@ -51,13 +52,14 @@ Where things live.
   names          a lookup attention head: a path -> its index (the path's end is the not-found
                  fallback, scoring between an exact match and any near miss)
   versions, bases, paths, file count     DeltaNet rows (one row per file)
-  links          a table of link bits: row (source, target) of DeltaNet state, 4 sources x 32
-                 targets per head, written by link and emptied by unlink. Rows store the target's
-                 column in eight heads and the source's in eight more, so a multi-hot query over
-                 a file's 32 rows reads all its links, or all its backlinks, as bits.
+  links          rows of the seek layer: a link that changes something adds a row for its pair
+                 (source, target), +1 for link and -1 for unlink. One that changes nothing
+                 (linking a linked pair, unlinking an unlinked one) prints a no-op variant of
+                 "linked" / "removed" (the same word to Qwen) and adds no row, so a pair's rows
+                 alternate and it is linked when its rows average above 0.
   offsets        a decaying DeltaNet counter, alpha = 2^(-1/16) per token, read in the head
                  norm's eps regime and decoded by thresholds (exact to 600 tokens)
-  words          a search head on the copy layer: each word of a written text is a row, keyed
+  words          rows of the seek layer: each word of a written text is a row, keyed
                  at the token after it by (index, base, the word's form; qfs/words.py), and a
                  search asks for one file's current base and the query's form per token
 
@@ -79,16 +81,16 @@ Layer 4   DeltaNet  version table, path table (index -> path, for listings and e
           MLP       the write and read acks at GO, empty path slots, a read's next segment
 Layer 5   DeltaNet  hold: the acks, the call's source and a link's target, the written text's
                     base, from their GOs
-          MLP       the forced tokens: the response frame, echoes, the path printer, link-bit
-                    write one-hots and listing queries
-Layer 6   DeltaNet  link bits
-          MLP       the listed file's links as clean bits; the search features: a word's key at
-                    the token after it, a check's query
-Layer 7   attention copy: a read's (index, version, offset) against the stored text; search:
-                    a checked file's current version and the query against the words
-          MLP       exit: the output code into the id dims, a read's next segment, link
-                    listings (the next set bit), search results (a marker or a skip per file),
-                    and every other FS dim cleared
+          MLP       the forced tokens: the response frame, echoes, the path printer; the seek
+                    features: a word's row, a link's row, a check's query
+Layer 6   attention seek: at a search's check, the checked file's base and the query against
+                    the words; at a link listing's check or a link call, the pair against the
+                    links
+          MLP       the pair's state as a clean bit
+Layer 7   attention copy: a read's (index, version, offset) against the stored text
+          MLP       exit: the output code into the id dims, a read's next segment, link calls
+                    (linked or its no-op), search and link listings (a marker or a skip per
+                    file), and every other FS dim cleared
 
 Exactness. Every token carries a ballast, so each FS norm is a fixed scale (256). DeltaNet
 registers pad their set rails to 2, 8, 32 or 128, so reads come back exactly 0/1 or +-1. Bits
@@ -108,31 +110,34 @@ IMSTART, USER, ASSISTANT, THINK, THINKEND, NOT, FOUND_ = 248045, 846, 74455, 248
 TCSTART, EMPTYW, DASH = 248058, 3092, 12
 EQTARGET, EQFILE, EQPATH, EQQUERY = 93435, 57242, 79114, 76478
 V_QWEN = 248320
-IB, VB = 5, 6
-ACKW0, ACKR0, NONE = 122 << 11, 123 << 11, 124 << 11   # id = base + (I << VB) + V
-MARK0 = 125 << 11                  # list markers: MARK0 + I
-SKIP0 = 126 << 11                  # search skips: SKIP0 + I
+IB, VB = 7, 6
+BLK = IB + VB                      # FS ids come in blocks of 2^BLK, past Qwen's vocabulary
+ACKW0, ACKR0, NONE = 32 << BLK, 33 << BLK, 34 << BLK   # id = base + (I << VB) + V
+MARK0 = 35 << BLK                  # list markers: MARK0 + I
+SKIP0 = 36 << BLK                  # search and link-listing skips: SKIP0 + I
 UNLINK_TOKENS = (64778, 45896)     # "unlink", " unlink"
 APPEND = 4928                      # "append"
 SAVED, LINKED, REMOVED, TO = 31617, 41710, 44232, 951
-IDB, OB = 18, 11
+IDB, OB = 19, 11
 NMAX = 600
 NSLOT = 8
 NFILE = 1 << IB
+CB = IB + 1                        # the file count's bits: 0..NFILE files
 VOCAB = SKIP0 + NFILE
+LINKEDN, REMOVEDN = NONE + 1, NONE + 2   # "linked" / "removed" that changed nothing
 S = 3                              # a searched word's tokens, at most (qfs.words.S)
 EMPTYC = (1 << IDB) - 1            # an empty slot's code: all +1
 
 DK, HD, ROT = 128, 256, 64
 K = 128.0
 Y = -3.125
-OFF, H = 2048, 3584
-NBAL, BAL = 14, 4096.0             # rms = sqrt(14 * 4096^2 / 3584) = 256 exactly
+OFF, H = 2048, 4096
+NBAL, BAL = 4, 8192.0              # rms = sqrt(4 * 8192^2 / 4096) = 256 exactly
 SCALE = 256.0
 EPS = 1.0 / 64
 LAYERS = ["linear_attention", "linear_attention", "linear_attention", "full_attention",
-          "linear_attention", "linear_attention", "linear_attention", "full_attention"]
-LOOKUP, PAIR, COPY, TABLE, COUNTL, DATAL = 3, 6, 7, 4, 2, 1     # layer indices
+          "linear_attention", "linear_attention", "full_attention", "full_attention"]
+LOOKUP, SEEK, COPY, TABLE, COUNTL, DATAL = 3, 6, 7, 4, 2, 1     # layer indices
 
 
 def ackw(i, v):
@@ -163,10 +168,11 @@ FLAG_TOKENS = {NL: "NL", GT: "GT", LTS: "LTS", EQNAME: "EQNAME", EQTEXT: "EQTEXT
                NL2: "NL2", NOT: "NOT", FOUND_: "FOUND", TCSTART: "TCSTART", EMPTYW: "EMPTYW",
                EQTARGET: "EQTARGET", EQFILE: "EQFILE", EQPATH: "EQPATH", EQQUERY: "EQQUERY",
                SAVED: "SAVED",
-               LINKED: "LINKED", REMOVED: "REMOVED", TO: "TO",
+               LINKED: "LINKED", REMOVED: "REMOVED", LINKEDN: "LINKED", REMOVEDN: "REMOVED",
+               TO: "TO",
                APPEND: "APPEND", **{t: "UNLINK" for t in UNLINK_TOKENS}}
 FL = {name: D.take() for name in dict.fromkeys(FLAG_TOKENS.values())}
-ISACKW, ISACKR, ISNONE, ISMARK, ISSKIP = (D.take() for _ in range(5))
+ISACKW, ISACKR, ISNONE, ISMARK, ISSKIP, ISNOOP = (D.take() for _ in range(6))
 ACKI, ACKV = D.take(IB), D.take(VB)
 LAG1 = {n: D.take() for n in ("NL", "GT", "TCEND", "TRESP", "TRESPEND", "OK", "USER",
                               "ASSISTANT", "THINK", "THINKEND", "NOT", "FOUND", "NONE",
@@ -179,15 +185,15 @@ LI = D.take(IB)
 U = D.take(NMAX)
 SLOTRAW = D.take(NSLOT)
 LS0 = D.take()                     # with SLOTRAW: the list slot one-hot (n = 0..NSLOT)
+LSC = D.take(NSLOT + 1)            # the same, clean 0/1 (the thermometer reads ~1.2 / -0.1)
 LIOH = D.take(NFILE)
 GO, ISCREATE = D.take(), D.take()
-CINC = D.take(IB)
+CINC = D.take(CB)
 TK = D.take(NFILE)
 NAME = [D.take(IDB) for _ in range(NSLOT)]
 RI, RV = D.take(IB), D.take(VB)
 MW, MR = D.take(), D.take()
-COUNT = D.take(IB)
-QF, QB = D.take(NFILE), D.take(NFILE)   # link-bit queries (made late; free early dims)
+COUNT = D.take(CB)
 # search. A token's word form (right-aligned, slot 0 the last token) and flags (a word token,
 # one with a leading space, one whose form is a single token): from qfs.words, in the embeddings
 WFORM = [D.take(IDB) for _ in range(S)]
@@ -206,6 +212,11 @@ BCK = D.take(VB)                   # the checked file's base, 0/1
 XI, XV = D.take(IB), D.take(VB)    # search features: index, base, form (+-1)
 XW = [D.take(IDB) for _ in range(S)]
 XT, SFOUND = D.take(), D.take()    # a word's row; the checked file has the word
+# links: a link listing's check, a link call's check; the pair (+-1 features); a link's row and
+# its value (+1 link, -1 unlink); the pair's rows averaged, and as a clean bit
+LCHK, OPCHK = D.take(), D.take()
+LS, LD = D.take(IB), D.take(IB)
+LT, LV, LSTATE, LIN = D.take(), D.take(), D.take(), D.take()
 # segments: an append call; the base at GO; the read file (one-hot) and its version; a read's
 # segment is not the last; the written text's base (+-1, made at GO and held)
 APP = D.take()
@@ -217,18 +228,12 @@ assert D.n <= H, D.n
 # features made from layer 2's MLP on, which clears the thermometer U, live in U's dims (the
 # file count one-hot is written by that same MLP: the clear and the write add up)
 Late = Dims(U[0])
-CO = Late.take(NFILE)              # file count one-hot
+CO = Late.take(NFILE + 1)          # file count one-hot
 KOFF, QOFF = Late.take(OB), Late.take(OB)
 LL = Late.take()                   # a link listing call (list_links or list_backlinks)
 GOS, GOT = Late.take(), Late.take()  # GO of a name/file path, GO of a target path
 HSRC, HDST = Late.take(IB), Late.take(IB)
 HSF, HDF = Late.take(), Late.take()
-# link-bit table: write one-hots at a link's target GO (source, target), unlink-gated values,
-# the listing queries, the reads and their clean bits
-SOHW, DOHW = Late.take(NFILE), Late.take(NFILE)
-SV, DV = Late.take(NFILE), Late.take(NFILE)
-PF, PB = Late.take(NFILE), Late.take(NFILE)
-BIT = Late.take(NFILE)
 FOUND = Late.take()
 FIDX = Late.take(IB)
 TQ = Late.take(NFILE)
@@ -507,7 +512,7 @@ def mlp1(xs):
     m.relu({FL["NL"]: 2.0, FL["NL2"]: 2.0, NAMING: 2.0, NSTART: -2.0, ONE: -3.0}, {GO: 1.0})
     m.match(ACKV, 1, flags=[ISACKW], down={ISCREATE: 1.0})
     for i in range(NFILE):
-        inc = {CINC[b]: float(c) for b, c in enumerate(pm(min(i + 1, NFILE - 1), IB))}
+        inc = {CINC[b]: float(c) for b, c in enumerate(pm(i + 1, CB))}
         m.match(ACKI + ACKV, i | (1 << IB), flags=[ISACKW], down=inc)
         m.match(ACKI, i, flags=[ISACKW], down={TK[i]: 1.0})
     return m
@@ -533,7 +538,7 @@ def layer2(net):
     d.register(NSLOT, {ISACKW: 1.0, ISACKR: 1.0, ISNONE: 1.0, LAG1["TCEND"]: 1.0,
                        LAG1["TRESPEND"]: 1.0}, fields)
     d.register(NSLOT + 1, {ISCREATE: 1.0},
-               [("bit01", {CINC[b]: 0.5, ONE: 0.5}, COUNT[b]) for b in range(IB)])
+               [("bit01", {CINC[b]: 0.5, ONE: 0.5}, COUNT[b]) for b in range(CB)])
     # search: the fourth token back is a word token; past the "</" that ends a text; a search
     d.register(NSLOT + 2, {ONE: 1.0}, [("bit01", {LF[2][0]: 1.0}, L4WD)], tap=-2)
     d.register(NSLOT + 3, {LAG1["LTS"]: 1.0, TSTART: 1.0}, [("bit01", {LAG1["LTS"]: 1.0}, PASTLTS)])
@@ -556,7 +561,7 @@ def mlp2():
     m.relu({ONE: 1.0}, bias)
     for u in U:                                   # free U's dims for the late features
         m.unit({ONE: K}, {u: -1 / K}, {u: 1.0})
-    for c in range(NFILE):
+    for c in range(NFILE + 1):
         m.match(COUNT, c, pm_dims=False, down={CO[c]: 1.0})
     m.relu({SAWFILE: 2.0, ONE: -1.0}, {LL: 1.0})
     m.relu({SAWPATH: 2.0, ONE: -1.0}, {LL: 1.0})
@@ -579,14 +584,18 @@ def mlp2():
         m.relu(lin, {WEND[k // 2]: 1.0})
     for j in range(S + 1):
         m.match(NAME[j], EMPTYC, down={QE[j]: 1.0})
+    for x, out in zip([LS0, *SLOTRAW], LSC):
+        m.relu({x: 2.0, ONE: -0.5}, {out: 1.0})
+        m.relu({x: 2.0, ONE: -1.5}, {out: -1.0})
     for i in range(NFILE):
         m.match(RI, i, down={RIOH[i]: 1.0})
-    # a search checks file 0 at the newline that opens its response, then file i + 1 at the
-    # newline that ends file i's path and at file i's skip
-    m.all_of([FL["NL"], LAG1["TRESP"], INCALL, SAWQUERY], {CK[0]: 1.0, CHK: 1.0})
-    for i in range(NFILE - 1):
-        m.all_of([FL["NL"], LISTMODE, INCALL, SAWQUERY, LIOH[i]], {CK[i + 1]: 1.0, CHK: 1.0})
-        m.all_of([ISSKIP, LIOH[i]], {CK[i + 1]: 1.0, CHK: 1.0})
+    # a search or a link listing checks file 0 at the newline that opens its response, then
+    # file i + 1 at the newline that ends file i's path and at file i's skip
+    for call, flag in ((SAWQUERY, CHK), (SAWFILE, LCHK), (SAWPATH, LCHK)):
+        m.all_of([FL["NL"], LAG1["TRESP"], INCALL, call], {CK[0]: 1.0, flag: 1.0})
+        for i in range(NFILE - 1):
+            m.all_of([FL["NL"], LISTMODE, INCALL, call, LIOH[i]], {CK[i + 1]: 1.0, flag: 1.0})
+            m.all_of([ISSKIP, call, LIOH[i]], {CK[i + 1]: 1.0, flag: 1.0})
     return m
 
 
@@ -750,8 +759,6 @@ def mlp5():
         ([f["FOUND"], l1["NOT"], INCALL], [], NL),
         ([f["NL"], l1["FOUND"], INCALL], [], TRESPEND),
         # link_files / unlink_files: ok, or not found (either file missing)
-        ([f["NL"], l1["TRESP"], INCALL, SAWTGT, HSF, HDF], [UNL], LINKED),
-        ([f["NL"], l1["TRESP"], INCALL, SAWTGT, HSF, HDF, UNL], [], REMOVED),
         ([f["NL"], l1["TRESP"], INCALL, SAWTGT], [HSF], NONE),
         ([f["NL"], l1["TRESP"], INCALL, SAWTGT, HSF], [HDF], NONE),
         # link / unlink: linked|removed, the source's path, "to", the target's path, the end
@@ -781,7 +788,7 @@ def mlp5():
     m.relu(x, {MORE: 1.0})
     m.relu({**x, ONE: -1.0}, {MORE: -1.0})
     # list: after a marker (slot n = 0) or a path's n-th token, its next token or a newline
-    ls = [LS0] + SLOTRAW
+    ls = LSC
     for n in range(NSLOT):
         for b in range(IDB):
             m.gated(NT[n][b], OUTC[b], [LISTMODE, ls[n]], nots=[NTE[n], f["NL"], f["TO"], ISSKIP])
@@ -796,63 +803,43 @@ def mlp5():
         for b in range(IB):
             m.gated(src[b], OUTC[b], flags)
         m.all_of(flags, mtop)
-    # link bits: at a link's target GO (both found), the pair to write, its value (empty for
-    # unlink); for a link listing, the rows to read (a file's links, or its backlinks)
-    at = [GOT, HSF, FOUND]
-    for i in range(NFILE):
-        m.match(HSRC, i, flags=at, down={SOHW[i]: 1.0})
-        m.match(FIDX, i, flags=at, down={DOHW[i]: 1.0})
-        m.match(HSRC, i, flags=at, nots=[UNL], down={SV[i]: 1.0})
-        m.match(FIDX, i, flags=at, nots=[UNL], down={DV[i]: 1.0})
-        m.match(HSRC, i, flags=[SAWFILE], down={QF[i]: 1.0})
-        m.match(HSRC, i, flags=[SAWPATH], down={QB[i]: 1.0})
     # after a path's newline: the next file's marker, or the end of the response
     for i in range(NFILE):
-        more = {CO[c]: 1.0 for c in range(i + 2, NFILE)}
-        done = {CO[c]: 1.0 for c in range(0, min(i + 2, NFILE))}
+        more = {CO[c]: 1.0 for c in range(i + 2, NFILE + 1)}
+        done = {CO[c]: 1.0 for c in range(i + 2)}
         # (a list_files call has no path: PENDING is clear; WROTE may be left from a write)
         base = {f["NL"]: 2.0, LISTMODE: 2.0, LIOH[i]: 2.0, LL: -2.0, PENDING: -2.0, SAWTGT: -2.0,
                 SAWQUERY: -2.0, ONE: -7.0}
         if i + 1 < NFILE:
             m.relu({**base, **{c: 2.0 for c in more}}, codes(OUTC, MARK0 + i + 1))
         m.relu({**base, **{c: 2.0 for c in done}}, codes(OUTC, TRESPEND))
-    return m
-
-
-def layer_pair(net):
-    """Link bits. Row (s, d) of head s // 4 (rows (s % 4) * 32 + d) is the pair: heads 0-7 hold
-    the target's column (a file's links), heads 8-15 the source's (its backlinks). Written at
-    a link's target GO (key on that one row, value one column or nothing for unlink); read with
-    a multi-hot query over all of a listed file's rows, which sums them."""
-    d = Delta(net)
-    for g, (vals, reads) in enumerate(((DV, PF), (SV, PB))):
-        for hh in range(NFILE // 4):
-            h = 8 * g + hh
-            for sl in range(4):
-                s_ = 4 * hh + sl
-                for t in range(NFILE):
-                    r = sl * NFILE + t
-                    d.k(h, r, {SOHW[s_]: 400.0, DOHW[t]: 400.0, ONE: -600.0})
-                    d.q(h, r, {QF[s_]: 20.0, QB[t]: 20.0})
-            for c in range(NFILE):
-                d.v(h, c, {vals[c]: 20.0})
-                d.out(h, c, reads[c], 1.0 / 32)
-            d.beta(h, {ONE: 30.0})
-            d.decay(h, {ONE: -100.0})
-            d.z(h, {ONE: 32.0})
-    common(net)
-
-
-def mlp_pair():
-    """Clean link bits of the listed file: a read is 0 or at least 2 (the head norm over at most
-    32 set columns), so relu(x) - relu(x - 1) is 0 or 1, for the call's direction."""
-    m = MLP()
-    for j in range(NFILE):
-        for x, flag in ((PF[j], SAWFILE), (PB[j], SAWPATH)):
-            m.unit({x: K}, {flag: 1 / K}, {BIT[j]: 1.0})
-            m.unit({x: K, ONE: -K}, {flag: 1 / K}, {BIT[j]: -1.0})
     search(m)
+    links(m)
     return m
+
+
+def links(m):
+    """The link features (all 0 elsewhere). A row at a "linked" or "removed" that changed the
+    pair (not a no-op): the call's source and target, +1 for link and -1 for unlink. The query
+    at a link call's first response token (source, target), and at a link listing's check: the
+    listed file and the checked one, in the call's direction."""
+    f = FL
+    for word, sign in ((f["LINKED"], 1.0), (f["REMOVED"], -1.0)):
+        on, off = [word, INCALL, SAWTGT], [ISNOOP]
+        m.all_of(on, {LT: 1.0, LV: sign}, nots=off)
+        for b in range(IB):
+            m.gated(HSRC[b], LS[b], on, nots=off)
+            m.gated(HDST[b], LD[b], on, nots=off)
+    op = [f["NL"], LAG1["TRESP"], INCALL, SAWTGT, HSF, HDF]
+    m.all_of(op, {OPCHK: 1.0})
+    for b in range(IB):
+        m.gated(HSRC[b], LS[b], op)
+        m.gated(HDST[b], LD[b], op)
+    for call, held, checked in ((SAWFILE, LS, LD), (SAWPATH, LD, LS)):
+        for b in range(IB):
+            m.gated(HSRC[b], held[b], [LCHK, call])
+        for k in range(NFILE):
+            m.all_of([CK[k], call], {checked[b]: float(c) for b, c in enumerate(pm(k, IB))})
 
 
 def search(m):
@@ -875,7 +862,7 @@ def search(m):
     m.relu({WEND[1]: 2.0, ONE: -1.0}, {XW[2][b]: float(c) for b, c in empty.items()})
     m.relu({WEND[0]: 2.0, WEND[1]: 2.0, WEND[2]: 2.0, ONE: -1.0}, {XT: 1.0})
     for k in range(NFILE):
-        m.all_of([CK[k], QV], {XI[b]: float(c) for b, c in enumerate(pm(k, IB))})
+        m.all_of([CK[k], CHK, QV], {XI[b]: float(c) for b, c in enumerate(pm(k, IB))})
     for b in range(VB):
         m.all_of([BCK[b], CHK, QV], {XV[b]: 2.0})
         m.all_of([CHK, QV], {XV[b]: -1.0})
@@ -888,7 +875,7 @@ def search(m):
                 m.all_of([CHK, QLEN[n - 1]], {XW[r][b]: float(c) for b, c in empty.items()})
 
 
-def layer6(att):
+def layer_copy(att):
     """Copy: a read's (index, version, offset) against the stored tokens."""
     q, k = att.q_proj.weight, att.k_proj.weight
     q[ROT, ONE] = 1.0
@@ -912,36 +899,53 @@ def layer6(att):
     q[HD:2 * HD, ONE] = -15.0
     att.q_norm.weight.fill_(GAIN7 - 1)
     att.k_norm.weight.fill_(GAIN7 - 1)
-    search_head(att)
 
 
-GAIN7, WS = 16.0, 4.0
+GAIN7, GAIN6, WS = 16.0, 16.0, 4.0
+SFEATS = XI + XV + [d for w in XW for d in w]       # a search's features, then a link's
+LFEATS = LS + LD
 
 
-def search_head(att):
-    """Search: at a check, the query (index, version, form) against the words' rows, on the
-    first query head of the second key/value head. The check's own row is the fallback: its
-    features are the query's, so it scores a little below a word that matches and above any
-    near miss. The value is 1 on a word's row: the output is ~1 if the file has the word."""
-    n_kv = att.k_proj.out_features // HD
-    n_q = att.q_proj.out_features // (2 * HD)
-    qh = n_q // n_kv
-    qb, kb = qh * 2 * HD, HD
+def layer_seek(att):
+    """Seek: at a search's check, its query against the words' rows; at a link listing's check
+    or a link call, the pair against the links' rows. A query's kind picks its own score dim
+    (search ROT, links ROT + 1), and a row of the other kind sits far below on it. The check's
+    own row is the fallback: its features are the query's, so it scores a little below a row
+    that matches and above any near miss. Values: 1 on a word's row (the output is ~1 if the
+    file has the word), and a link row's +-1 (the pair's rows averaged)."""
     q, k = att.q_proj.weight, att.k_proj.weight
-    feats = XI + XV + [d for w in XW for d in w]
-    q[qb + ROT, ONE] = WS
-    k[kb + ROT, XT] = 2.0
-    k[kb + ROT, CHK] = 2.0 - 1.0 / WS
-    k[kb + ROT, ONE] = -1.0
-    for i, d in enumerate(feats):
-        q[qb + ROT + 1 + i, d] = 1.0
-        k[kb + ROT + 1 + i, d] = 1.0
-    q[qb + HD:qb + 2 * HD, ONE] = 20.0
-    att.v_proj.weight[kb, XT] = 1.0
-    att.o_proj.weight[SFOUND, qh * HD] = 1.0
+    q[ROT, CHK] = WS
+    q[ROT + 1, LCHK] = WS
+    q[ROT + 1, OPCHK] = WS
+    k[ROT, XT] = 2.0
+    k[ROT, CHK] = 2.0 - 1.0 / WS
+    k[ROT, ONE] = -1.0
+    k[ROT + 1, LT] = 2.0
+    k[ROT + 1, LCHK] = 2.0 - 1.0 / WS
+    k[ROT + 1, OPCHK] = 2.0 - 1.0 / WS
+    k[ROT + 1, ONE] = -1.0
+    for i, d in enumerate(SFEATS + LFEATS):
+        q[ROT + 2 + i, d] = 1.0
+        k[ROT + 2 + i, d] = 1.0
+    q[HD:2 * HD, ONE] = 20.0
+    att.v_proj.weight[0, XT] = 1.0
+    att.v_proj.weight[1, LV] = 1.0
+    att.o_proj.weight[SFOUND, 0] = 1.0
+    att.o_proj.weight[LSTATE, 1] = 1.0
+    att.q_norm.weight.fill_(GAIN6 - 1)
+    att.k_norm.weight.fill_(GAIN6 - 1)
 
 
-def mlp6():
+def mlp_seek():
+    """A pair's rows average 1/n > 0 when it is linked (n alternating rows, the last a link) and
+    0 when not: as a clean bit."""
+    m = MLP()
+    m.relu({LSTATE: 128.0}, {LIN: 1.0})
+    m.relu({LSTATE: 128.0, ONE: -1.0}, {LIN: -1.0})
+    return m
+
+
+def mlp_exit():
     """Exit: the output code into the id dims, EPS-sized. A copied "</" (the text's end, as
     Qwen closed its parameter) comes out as </tool_response>.
     Every other FS dim, ballast included, is cleared."""
@@ -949,12 +953,13 @@ def mlp6():
     for o, i in zip(OUTC, IDC):
         m.unit({ONE: K}, {o: EPS / K, i: -1 / K}, {i: 1.0})
     swap = {d: EPS * (a - b) for d, a, b in zip(IDC, code(TRESPEND), code(LTS))}
-    s = {o: 4.0 * float(c) for o, c in zip(OUTC, code(LTS))}       # 72 on a match, <= 64 else
-    m.relu({**s, MORE: -2.0, ONE: -70.0}, swap)
-    m.relu({**s, MORE: -2.0, ONE: -71.0}, {d: -w for d, w in swap.items()})
+    s = {o: 4.0 * float(c) for o, c in zip(OUTC, code(LTS))}       # mt on a match, <= mt - 8
+    mt = 4.0 * IDB
+    m.relu({**s, MORE: -2.0, ONE: 2.0 - mt}, swap)
+    m.relu({**s, MORE: -2.0, ONE: 1.0 - mt}, {d: -w for d, w in swap.items()})
     # a segment that is not the last: its "</" becomes the next segment's read ack (the read's
     # index, its version + 1); g = 1 there, <= -1 everywhere else
-    g = {**s, MORE: 2.0, ONE: -73.0}
+    g = {**s, MORE: 2.0, ONE: -1.0 - mt}
     top = IB + VB
     m.relu(g, {**{d: -EPS * c for d, c in zip(IDC, code(LTS))},
                **{d: EPS * c - EPS * c0 for d, c, c0 in
@@ -969,25 +974,8 @@ def mlp6():
         lin.update({k: 2.0 * w for k, w in g.items() if k != ONE})
         lin[ONE] = 2.0 * g[ONE] - 2.0 - (VB - 1)
         m.relu(lin, {d: EPS * c for d, c in zip(IDC[:VB], pm(min(v + 1, (1 << VB) - 1), VB))})
-    # link listings: the first set bit, then after file i's path the next set bit after i, or
-    # the end; with no set bit, "empty"
     out = lambda t: {d: EPS * c for d, c in zip(IDC, code(t))}
-    first = [FL["NL"], LAG1["TRESP"], INCALL, LL, HSF]
-    nxt = [FL["NL"], LISTMODE, LL]
-    fl = lambda fs: {f: 2.0 for f in fs}
-    for j in range(NFILE):
-        m.relu({**fl(first), BIT[j]: 2.0, **{BIT[k]: -2.0 for k in range(j)},
-                ONE: -2.0 * len(first) - 1.0}, out(MARK0 + j))
-    m.relu({**fl(first), **{BIT[k]: -2.0 for k in range(NFILE)}, ONE: -2.0 * len(first) + 1.0},
-           out(EMPTYW))
-    for i in range(NFILE):
-        for j in range(i + 1, NFILE):
-            m.relu({**fl(nxt), LIOH[i]: 2.0, BIT[j]: 2.0, **{BIT[k]: -2.0 for k in range(i + 1, j)},
-                    ONE: -2.0 * len(nxt) - 3.0}, out(MARK0 + j))
-        m.relu({**fl(nxt), LIOH[i]: 2.0, **{BIT[k]: -2.0 for k in range(i + 1, NFILE)},
-                ONE: -2.0 * len(nxt) - 1.0}, out(TRESPEND))
-    # search results: at each check, the checked file's marker if it has the word, else its
-    # skip; past the last file the end, or "empty" if no file had it
+
     def rule(on, off, t):
         lin = {d: 2.0 for d in on}
         for d in off:
@@ -1003,21 +991,30 @@ def mlp6():
         lin[ONE] = -(2.0 * (1 + len(flags)) - 1.0)
         m.relu(lin, out(t))
 
-    first = [FL["NL"], LAG1["TRESP"], INCALL, SAWQUERY]
-    rule(first, [QV], EMPTYW)
-    rule(first + [QV, CO[0]], [], EMPTYW)
-    rule(first + [QV, SFOUND], [CO[0]], MARK0)
-    rule(first + [QV], [CO[0], SFOUND], SKIP0)
-    for i in range(NFILE):
-        more = [CO[c] for c in range(i + 2, NFILE)]
-        done = [CO[c] for c in range(min(i + 2, NFILE))]
-        for trig in ([FL["NL"], LISTMODE, INCALL, SAWQUERY, LIOH[i]], [ISSKIP, LIOH[i]]):
-            if more:
-                at(more, trig, [SFOUND], [], MARK0 + i + 1)
-                at(more, trig, [], [SFOUND], SKIP0 + i + 1)
-            at(done, trig, [LISTMODE], [], TRESPEND)
-            if LISTMODE not in trig:
-                at(done, trig, [], [LISTMODE], EMPTYW)
+    # a link call: "linked" / "removed" if it changes the pair, else its no-op variant
+    op = [FL["NL"], LAG1["TRESP"], INCALL, SAWTGT, HSF, HDF]
+    for on, off, t in (([], [UNL, LIN], LINKED), ([LIN], [UNL], LINKEDN),
+                       ([UNL, LIN], [], REMOVED), ([UNL], [LIN], REMOVEDN)):
+        rule(op + on, off, t)
+    # search and link listing results: at each check, the checked file's marker if it matches
+    # (has the word; is linked), else its skip; past the last file the end, or "empty" if no
+    # file matched. A link listing's file exists (else "not found"), so there is a file 0.
+    rule([FL["NL"], LAG1["TRESP"], INCALL, SAWQUERY], [QV], EMPTYW)
+    for call, hit, first in ((SAWQUERY, SFOUND, [QV]), (LL, LIN, [HSF])):
+        trig0 = [FL["NL"], LAG1["TRESP"], INCALL, call, *first]
+        rule(trig0 + [CO[0]], [], EMPTYW)
+        rule(trig0 + [hit], [CO[0]], MARK0)
+        rule(trig0, [CO[0], hit], SKIP0)
+        for i in range(NFILE):
+            more = [CO[c] for c in range(i + 2, NFILE + 1)]
+            done = [CO[c] for c in range(i + 2)]
+            for trig in ([FL["NL"], LISTMODE, INCALL, call, LIOH[i]], [ISSKIP, call, LIOH[i]]):
+                if more:
+                    at(more, trig, [hit], [], MARK0 + i + 1)
+                    at(more, trig, [], [hit], SKIP0 + i + 1)
+                at(done, trig, [LISTMODE], [], TRESPEND)
+                if LISTMODE not in trig:
+                    at(done, trig, [], [LISTMODE], EMPTYW)
     for dd in range(B_[-1] + 1, D.n):
         if dd not in IDC:
             m.unit({ONE: K}, {dd: -1 / K}, {dd: 1.0})
@@ -1044,6 +1041,8 @@ def embeddings(E, words=None):
                 E[t, flag] = 1
                 E[t, ACKI] = torch.tensor(pm(i, IB), dtype=E.dtype)
                 E[t, ACKV] = torch.tensor(pm(v, VB), dtype=E.dtype)
+    E[LINKEDN, ISNOOP] = 1
+    E[REMOVEDN, ISNOOP] = 1
     for i in range(NFILE):
         E[SKIP0 + i, ISSKIP] = 1
         E[SKIP0 + i, ACKI] = torch.tensor(pm(i, IB), dtype=E.dtype)
@@ -1079,10 +1078,10 @@ def fill(layers, xs):
     layer3(layers[3].self_attn)
     layer4(layers[4].linear_attn)
     layer5(layers[5].linear_attn)
-    layer_pair(layers[6].linear_attn)
-    layer6(layers[7].self_attn)
+    layer_seek(layers[SEEK].self_attn)
+    layer_copy(layers[COPY].self_attn)
     mlps = [mlp_p(), mlp1(xs) if xs is not None else MLP(), mlp2(), mlp3(), mlp4(), mlp5(),
-            mlp_pair(), mlp6()]
+            mlp_seek(), mlp_exit()]
     for layer, m in zip(layers, mlps):
         assert len(m.units) <= layer.mlp.gate_proj.out_features, len(m.units)
         m.write(layer.mlp)
@@ -1090,7 +1089,7 @@ def fill(layers, xs):
 
 def config():
     return Qwen3_5TextConfig(
-        vocab_size=VOCAB, hidden_size=H, intermediate_size=2 * NMAX + 1600,
+        vocab_size=VOCAB, hidden_size=H, intermediate_size=4096,
         num_hidden_layers=len(LAYERS), layer_types=LAYERS, num_attention_heads=2,
         num_key_value_heads=2, head_dim=HD, attn_output_gate=True,
         linear_num_key_heads=16, linear_num_value_heads=16, linear_key_head_dim=DK, linear_value_head_dim=DK,

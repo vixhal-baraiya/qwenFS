@@ -1,15 +1,16 @@
 """The filesystem as the model holds it, read from its state, and what the circuit is doing.
 
-`read` decodes the DeltaNet tables of a cache (nothing is kept on the side): the file count, each
-file's version and path from the version and path tables (layer 4), and every link from the link
-bits (layer 6). Rows are dual-rail, so a bit is whichever of its two rails is set.
+`read` decodes the model's state in a cache (nothing is kept on the side): the file count, each
+file's version and path from the DeltaNet version and path tables (layer 4), where rows are
+dual-rail, so a bit is whichever of its two rails is set; and every link from the seek layer's
+link rows (layer 6), each a pair in its key's signs and +1 or -1 in its value.
 
 `Monitor` follows the token stream and lights the circuit's layers: the call parser while Qwen
 writes a call, the lookup and the tables at a call's end, the path printer, the link bits and the
 copy head as the response comes out.
 """
 from qfs import circuit as F
-from qfs.disk import COPY, COUNTL, LOOKUP, PAIR, TABLE
+from qfs.disk import COPY, COUNTL, LOOKUP, SEEK, TABLE
 
 # the FS layers as the panel shows them: (name, what it holds or does)
 LAYERS = [
@@ -19,8 +20,8 @@ LAYERS = [
     ("3", "attention", "lookup: a path -> its file"),
     ("4", "DeltaNet", "version table, path table"),
     ("5", "DeltaNet", "held acks; MLP: forced tokens"),
-    ("6", "DeltaNet", "link bits"),
-    ("7", "attention", "copy: the files' text; search"),
+    ("6", "attention", "seek: links, words"),
+    ("7", "attention", "copy: the files' text"),
 ]
 
 
@@ -39,14 +40,12 @@ def read(cache):
     def state(li):            # a layer's state, or None before the first token
         r = getattr(cache.layers[li], "recurrent_states", None)
         return r[0][0] if r is not None and len(r) and r[0] is not None else None
-    rec = {li: x for li in (TABLE, PAIR, COUNTL) if (x := state(li)) is not None}
+    rec = {li: x for li in (TABLE, COUNTL) if (x := state(li)) is not None}
     if TABLE not in rec:
         return {"count": 0, "files": {}, "links": set(), "rows": 0, "lookup": 0,
                 "vbits": [[0] * F.VB for _ in range(F.NFILE)]}
     table = rec[TABLE][:, :F.NFILE, :2 * F.IDB].float().cpu()
-    count = value(bits01(rec[COUNTL][F.NSLOT + 1, 0, :2 * F.IB].float().cpu(), F.IB))
-    if table[0].abs().sum() and not count:     # 32 files wrap the 5-bit count to 0
-        count = F.NFILE
+    count = value(bits01(rec[COUNTL][F.NSLOT + 1, 0, :2 * F.CB].float().cpu(), F.CB))
     files = {}
     for i in range(count):
         v = value(bits01(table[0, i], F.VB))
@@ -57,14 +56,7 @@ def read(cache):
                 break
             name.append(t)
         files[i] = (tuple(name), v)
-    links = set()
-    if PAIR in rec:
-        pair = rec[PAIR].float().cpu()
-        for s in range(count):
-            rows = pair[s // 4, (s % 4) * F.NFILE:(s % 4 + 1) * F.NFILE]
-            for d in range(count):
-                if rows[d, d] > 10:
-                    links.add((s, d))
+    links = seek_links(cache, count)
 
     def length(li):
         c = cache.layers[li]
@@ -72,6 +64,22 @@ def read(cache):
     vbits = [bits01(table[0, i], F.VB) if i < count else [0] * F.VB for i in range(F.NFILE)]
     return {"count": count, "files": files, "links": links, "rows": length(COPY),
             "lookup": length(LOOKUP), "vbits": vbits}
+
+
+def seek_links(cache, count):
+    """{(S, D)}: the pairs whose link rows in the seek layer add up to +1."""
+    c = cache.layers[SEEK]
+    if getattr(c, "keys", None) is None or not c.keys.shape[-2]:
+        return set()
+    k, v = c.keys[0, 0].float().cpu(), c.values[0, 0, :, 1].float().cpu()
+    at = F.ROT + 2 + len(F.SFEATS)
+    rows = (v.abs() > 0.5).nonzero().flatten().tolist()
+    tally = {}
+    for r in rows:
+        s_ = value([int(x > 0) for x in k[r, at:at + F.IB].tolist()])
+        d_ = value([int(x > 0) for x in k[r, at + F.IB:at + 2 * F.IB].tolist()])
+        tally[(s_, d_)] = tally.get((s_, d_), 0) + round(v[r].item())
+    return {p for p, n in tally.items() if n > 0 and max(p) < count}
 
 
 class Monitor:
@@ -99,11 +107,9 @@ class Monitor:
             lit.append(5)                          # every response token is a forced token
             if F.MARK0 <= t < F.MARK0 + F.NFILE:
                 lit.append(4)                      # a listed path: the path table
-                if func in ("list_links", "list_backlinks"):
-                    lit.append(6)                  # the next set link bit
-            if func == "search_files" and (F.MARK0 <= t < F.MARK0 + F.NFILE
-                                           or F.SKIP0 <= t < F.SKIP0 + F.NFILE):
-                lit += [4, 7]                      # a file checked: its version, the words
+            if (func in ("search_files", "list_links", "list_backlinks")
+                    and (F.MARK0 <= t < F.MARK0 + F.NFILE or F.SKIP0 <= t < F.SKIP0 + F.NFILE)):
+                lit += [4, 6]                      # a file checked: the seek layer
             elif F.ACKW0 <= t < F.ACKR0:
                 lit += [3, 4]                      # a write: lookup and the version table
             elif F.ACKR0 <= t < F.NONE:
@@ -111,7 +117,7 @@ class Monitor:
                                                    # (or its next segment)
             elif func == "read_file" and t < F.V_QWEN:
                 lit.append(7)                      # copied text
-            if t in (F.LINKED, F.REMOVED):
+            if t in (F.LINKED, F.REMOVED, F.LINKEDN, F.REMOVEDN):
                 lit.append(6)
         for k in lit:
             self.lights[k] = 1.0

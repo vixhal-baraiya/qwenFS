@@ -17,9 +17,11 @@ from pathlib import Path
 
 import numpy as np
 
+from qfs.circuit import IDB
+
 S = 3                                   # a word's tokens, at most
-EMPTY = (1 << 18) - 1                   # an unused slot (the circuit's all +1 code)
-NEVER = (1 << 18) - 2                   # a form no query has
+EMPTY = (1 << IDB) - 1                  # an unused slot (the circuit's all +1 code)
+NEVER = (1 << IDB) - 2                  # a form no query has
 WD, SP, X1 = 0, 1, 2
 CACHE = Path.home() / ".cache" / "qfs"
 
@@ -59,7 +61,7 @@ def build(tok, vocab):
 def table(tok, vocab):
     """`build`, cached by the tokenizer's vocabulary."""
     key = hashlib.sha1(repr(sorted(tok.get_vocab().items())).encode()).hexdigest()[:16]
-    f = CACHE / f"words-{key}-{vocab}-{S}.npz"
+    f = CACHE / f"words-{key}-{vocab}-{S}-{IDB}.npz"
     if f.exists():
         z = np.load(f)
         return z["slots"], z["flags"]

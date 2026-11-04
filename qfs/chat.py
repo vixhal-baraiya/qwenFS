@@ -85,6 +85,8 @@ def show(tok, ids):
             out.append(f"[r {x >> F.VB} {x & 63}]")
         elif t == F.NONE:
             out.append("[none]")
+        elif t in (F.LINKEDN, F.REMOVEDN):            # a no-op: the same word to Qwen
+            out.append(tok.decode([F.LINKED if t == F.LINKEDN else F.REMOVED]) + "[no-op]")
         elif F.MARK0 <= t < F.MARK0 + F.NFILE:
             out.append(f"[m {t - F.MARK0}]")
         elif F.SKIP0 <= t < F.SKIP0 + F.NFILE:

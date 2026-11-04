@@ -49,7 +49,7 @@ A missing file gives "not found".
 - To remove one link, unlink exactly that pair; the other links stay.
 - To find files by what they say, search one word, spelled as in the files: search_files
   matches whole words exactly, and capitals count (Berlin, not berlin).
-- Limits: 32 files; about 500 words per write_file or append_file call. A file can grow past
+- Limits: 128 files; about 500 words per write_file or append_file call. A file can grow past
   that through appends, up to 63 writes and appends in all.
 
 ## Examples
@@ -112,6 +112,7 @@ def render(tok, ids):
     """Response tokens as Qwen reads them: acks and skips blank, markers as "-"."""
     out = []
     for t in ids:
+        t = {F.LINKEDN: F.LINKED, F.REMOVEDN: F.REMOVED}.get(t, t)   # a no-op reads the same
         if F.ACKW0 <= t <= F.NONE or F.SKIP0 <= t < F.SKIP0 + F.NFILE:
             continue
         out.append("-" if F.MARK0 <= t < F.MARK0 + F.NFILE else tok.decode([t]))

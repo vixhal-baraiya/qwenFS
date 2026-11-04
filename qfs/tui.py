@@ -270,8 +270,8 @@ def indented(t: Text, first: bool = True) -> Text:
 
 class FSView(Vertical):
     """The filesystem as the model holds it, drawn as the circuit's own parts: a status card, the
-    FS layers as a pipeline, the file table (the version table's 32 rows), the link bits (layer
-    6's table), the copy layer's rows, the folders, and the disk."""
+    FS layers as a pipeline, the file table (the version table's 128 rows), the links (the seek
+    layer's link rows), the copy layer's rows, the folders, and the disk."""
 
     def __init__(self) -> None:
         super().__init__(id="fs")
@@ -418,65 +418,52 @@ class FSView(Vertical):
         return light(self.touched.get(i, 0.0), LIT, hue), "rgb(18,20,24)"
 
     def draw_table(self) -> Text:
-        """The 32 file slots of the version table as tiles: a file's folder colour, its slot
-        and its version; a slot lights as the circuit acks or lists it."""
+        """The version table's file slots as a map, two slots per character cell (an upper half
+        block over a lower one): a file's folder colour, lit as the circuit acks or lists it.
+        Under it, the last file touched: its slot, path, version and size."""
         t, w = Text(), self.width_of(self.cards["table"])
         files = self.state["files"]
-        tw = max(3, min(6, (w - 7) // 8))
-        out = []
-        for r in range(4):
-            for line in range(2):
-                row = Text()
-                for c in range(8):
-                    i = 8 * r + c
-                    bg, fg = self.tile(i)
-                    label = f"{i}" if line == 0 else (f"v{files[i][1]}" if i in files else "")
-                    row.append(f"{label:^{tw}}", style=f"{fg} on {bg}")
-                    row.append(" " if c < 7 else "")
-                out.append(row)
-            if r < 3:
-                out.append(Text(""))
-        t = Text("\n").join(out)
+        cols = 32 if w >= 36 else 16
+        rows = F.NFILE // cols
+        for line in range(0, rows, 2):
+            t.append("\n" if line else "")
+            for c in range(cols):
+                top, bottom = self.tile(line * cols + c)[0], self.tile((line + 1) * cols + c)[0]
+                t.append("▀", style=f"{top} on {bottom}")
+            if line == 0:
+                t.append(f"  {len(files)}/{F.NFILE}", style="dim")
         i = self.last if self.last in files else (min(files) if files else None)
         t.append("\n")
         if i is None:
             t.append(" ", style="dim")
         else:
             path, v, n = files[i]
-            t.append(short_text(path, w - 14), style="bold")
+            t.append(f"{i} ", style="dim")
+            t.append(short_text(path, w - 18), style="bold")
             t.append(f"  v{v} · {n} tok", style="dim")
         return t
 
     def draw_links(self) -> Text:
-        """Layer 6's link bits as a map: a row per source slot, a column per target."""
+        """The links, as the seek layer's link rows hold them: one line each, source to target,
+        the newest first and lit as it is made; a removed one fades out in red."""
         t, w = Text(), self.width_of(self.cards["links"])
         links, files = self.state["links"], self.state["files"]
-        n = min(F.NFILE, max(8, -(-max(len(files), 1) // 8) * 8))
-
-        def cell(s: int, d: int) -> str:
-            if (s, d) in self.unlinked:
-                return light(self.unlinked[(s, d)], ERR_RGB, GRID)
-            if (s, d) in links:
-                return light(self.linked.get((s, d), 0.0), LIT, LINK)
-            used = s in files and d in files
-            return light(0, GRID_USED if used else GRID, GRID_USED if used else GRID)
-
-        gap = 3 * n + 12 <= w  # cells with a gap between them, if they fit
-        rows = range(n) if n <= 16 else range(0, n, 2)
-        for k, s in enumerate(rows):
+        name = lambda i: files[i][0] if i in files else str(i)
+        shown = sorted(links, key=lambda p: -self.linked.get(p, 0.0))
+        shown += [p for p in self.unlinked if p not in links]
+        if not shown:
+            return Text("no links", style="dim")
+        half = max(6, (w - 4) // 2)
+        for k, (a, b) in enumerate(shown[:6]):
+            gone = (a, b) not in links
+            col = (light(self.unlinked.get((a, b), 0.0), ERR_RGB, DIM) if gone else
+                   light(self.linked.get((a, b), 0.0), LIT, LINK))
             t.append("\n" if k else "")
-            for d in range(n):
-                if n <= 16:  # an upper half block: a square cell, with a gap below it
-                    t.append("▀▀", style=cell(s, d))
-                    t.append(" " if gap else "")
-                else:  # two sources per line: the upper half's colour over the lower's
-                    t.append("▀", style=f"{cell(s, d)} on {cell(s + 1, d)}")
-            if k == 0:
-                t.append("  source ↓", style="dim")
-            elif k == 1:
-                t.append("  target →", style="dim")
-            elif k == 3 and links:
-                t.append(f"  {len(links)} set", style="dim")
+            t.append(short_text(name(a), half), style=col)
+            t.append(" → ", style="dim")
+            t.append(short_text(name(b), half), style=col)
+        more = len(shown) - 6
+        t.append(f"\n{len(links)} set" + (f" · {more} more" if more > 0 else ""), style="dim")
         return t
 
     def draw_copy(self) -> Text:
