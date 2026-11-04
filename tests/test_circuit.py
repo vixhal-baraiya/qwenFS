@@ -1,9 +1,10 @@
 """The circuit on scripted Qwen tool calls, against a reference filesystem.
 
 Sessions are written as Qwen3.5 writes tool calls (write_file with name and text, read_file with
-name); everything the circuit must produce (the write ack where the text starts, the tool
-response frames, the read-backs, <none> for missing names) is checked: in one prefill, and by
-greedy decoding with the cache from each read's </tool_call>.
+name, and the rest); everything the circuit must produce (the write ack where the text starts,
+the tool response frames, the read-backs, <none> for missing names, listings, search results) is
+checked: in one prefill, and by greedy decoding with the cache from each read's </tool_call>.
+Searches are checked against qfs.words, the rule in Python.
 
 Usage: python -m tests.test_circuit [--seed 0] [--files 10] [--maxlen 300] [--model MERGED]
 """
@@ -14,9 +15,10 @@ import time
 import torch
 
 from qfs import circuit as F
+from qfs import words as W
 
 TC, LT, FUNCTION, EQ, WRITE, EQREAD, FILE, PARAMETER = 248058, 27, 1628, 28, 4775, 86779, 2378, 15704
-SKIP = {F.EQNAME, F.EQTEXT}
+SKIP = {F.EQNAME, F.EQTEXT, F.EQQUERY}
 
 
 def text(rng, n):
@@ -54,6 +56,8 @@ TURN = [F.NL, F.IMSTART, F.ASSISTANT, F.NL, F.THINK, F.NL2, F.THINKEND, F.NL2]
 
 
 class Session:
+    words = None                       # (slots, flags) for searches: qfs.words.table
+
     def __init__(self, rng):
         self.rng, self.index, self.files, self.links = rng, {}, {}, set()
         self.toks, self.forced, self.reads = text(rng, 20), {}, []
@@ -135,6 +139,21 @@ class Session:
         self.toks += CALL_TAIL
         self.respond(len(self.toks), self.listed(nm, "back"))
 
+    def word_forms(self, nm):
+        return set(W.words(self.files[nm], *self.words).values())
+
+    def search(self, q):
+        """search_files with the query's tokens q."""
+        self.toks += [TC, F.NL, LT, FUNCTION, EQ, 1005, FILE, F.GT, F.NL]
+        self.toks += self.param(F.EQQUERY, q) + CALL_TAIL
+        form, body = W.query(q), []
+        if form is not None:
+            for nm, (i, _) in sorted(self.index.items(), key=lambda kv: kv[1][0]):
+                body += [F.MARK0 + i, *nm, F.NL] if form in self.word_forms(nm) else [F.SKIP0 + i]
+        if not any(F.MARK0 <= t < F.MARK0 + F.NFILE for t in body):
+            body += [F.EMPTYW, F.NL]
+        self.respond(len(self.toks), body)
+
     def read(self, nm):
         self.toks += call_head([EQREAD, FILE], nm, F.NL2 if self.rng.random() < 0.3 else F.NL) + CALL_TAIL
         start = len(self.toks)
@@ -177,7 +196,40 @@ def make(seed, nfiles, maxlen, misses=3):
         s.read(nm)
         if k == len(order) // 2:
             s.listing()
+    if s.words is not None:
+        searches(rng, s, stored)
     return s
+
+
+def searches(rng, s, stored):
+    """Words of current files (one, two and three tokens), words only an older version had, words
+    no file has, too long and empty queries; then a file rewritten and searched again."""
+    def form_toks(f):
+        return [t for t in reversed(f) if t != W.EMPTY]
+
+    live = [f for nm in stored for f in s.word_forms(nm) if W.NEVER not in f]
+    by_len = {n: [f for f in live if len(form_toks(f)) == n] for n in (1, 2, 3)}
+    qs = [form_toks(rng.choice(fs)) for n, fs in by_len.items() for _ in range(2) if fs]
+    qs += [list(text(rng, 1)), list(text(rng, 4)), []]
+    for q in qs:
+        s.search(q)
+    # words several files share: " Paris" (one token) and "milk" ("m" "ilk", at a line's start);
+    # one file has them only in its old text
+    paris, milk = [11751, 11], [F.NL, 76, 32062, 11]
+    shared = rng.sample(stored, min(4, len(stored)))
+    for k, nm in enumerate(shared):
+        body = text(rng, rng.randrange(5, 40))
+        cut = rng.randrange(len(body))
+        s.write(nm, body[:cut] + paris + milk + body[cut:])
+    s.write(shared[-1], text(rng, 30))
+    for q in ([57590], [76, 32062], [57590, 76]):     # "Paris", "milk", "Parism"
+        s.search(q)
+    nm = stored[0]
+    if s.files[nm]:
+        q = form_toks(next(iter(s.word_forms(nm)), (W.EMPTY,) * W.S))
+        s.write(nm, text(rng, 20))
+        if q:
+            s.search(q)                    # the old text had it: not found unless the new one has
 
 
 @torch.no_grad()
@@ -226,8 +278,9 @@ def main():
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
         model = Qwen3_5ForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16).to(dev).eval()
     else:
-        model = F.build(dev, F.calibrate(dev))
+        model = F.build(dev, F.calibrate(dev), W.table(W.tokenizer(), F.VOCAB))
     print(f"model ready in {time.time() - t0:.0f}s")
+    Session.words = W.table(W.tokenizer(a.model), F.VOCAB)
     s = make(a.seed, a.files, a.maxlen)
     print(f"session: {len(s.toks)} tokens, {len(s.reads)} reads, {len(s.forced)} forced tokens")
     good, total, bad = check_prefill(model, s, dev)

@@ -222,7 +222,8 @@ class Session:
         yield Event("done", {"tokens": n, "seconds": time.time() - t0})
 
     def _response(self, func, body, paged):
-        """A response's text as Qwen reads it (a marker reads as "-"), and its ack."""
+        """A response's text as Qwen reads it (a marker reads as "-"; a skip as a newline, so it
+        is left out), and its ack."""
         ack, pieces = None, [[]]
         for t in body:
             if F.ACKW0 <= t < F.NONE:
@@ -233,6 +234,8 @@ class Session:
                 ack = {"kind": "none"}
             elif F.MARK0 <= t < F.MARK0 + F.NFILE:
                 pieces.append([])
+            elif F.SKIP0 <= t < F.SKIP0 + F.NFILE:
+                pass                                   # a file a search passed over
             else:
                 pieces[-1].append(t)
         text = self.tok.decode(pieces[0]) + "".join("- " + self.tok.decode(p) for p in pieces[1:])

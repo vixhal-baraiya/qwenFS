@@ -57,6 +57,12 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "the file path"}},
             "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "search_files", "description": "Find the files whose text has a word (exact "
+        "and case-sensitive, e.g. Paris).",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "one word"}},
+            "required": ["query"]}}},
 ]
 IM_END = 248046
 
@@ -74,6 +80,8 @@ def show(tok, ids):
             out.append("[none]")
         elif F.MARK0 <= t < F.MARK0 + F.NFILE:
             out.append(f"[m {t - F.MARK0}]")
+        elif F.SKIP0 <= t < F.SKIP0 + F.NFILE:
+            out.append(f"[s {t - F.SKIP0}]")
         elif t == -1:
             out.append(" [cut at the token limit]")
         else:

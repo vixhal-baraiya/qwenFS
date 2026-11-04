@@ -41,7 +41,7 @@ def text_has(*words):
 
 
 W, R, L, U = "write_file", "read_file", "link_files", "unlink_files"
-LF, LL, LB = "list_files", "list_links", "list_backlinks"
+LF, LL, LB, SF = "list_files", "list_links", "list_backlinks", "search_files"
 NO_LINKS = [call(L), call(U)]
 
 SCENARIOS = {
@@ -66,6 +66,14 @@ SCENARIOS = {
          [call(W, path("name", "people/", "bob"))], NO_LINKS, [], []),
         ("What files do I have saved?",
          [call(LF)], NO_LINKS + [call(W)], ["alice", "bob"], []),
+    ],
+    "search": [
+        ("Remember my friend Alice, a designer in Paris. Save her in the people folder.",
+         [call(W, path("name", "people/", "alice"))], NO_LINKS, [], []),
+        ("Also remember Bob, a chef in Tokyo, in the people folder.",
+         [call(W, path("name", "people/", "bob"))], NO_LINKS, [], []),
+        ("Who do I know in Tokyo? Search my files.",
+         [call(SF, path("query", "tokyo"))], NO_LINKS + [call(W)], ["bob"], []),
     ],
     "links": [
         ("Save people/alice.txt: Alice is a designer. Then save projects/cafe.txt: a new cafe "

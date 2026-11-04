@@ -12,8 +12,10 @@ from a session's token log by `compact`, using the write acks the model emitted 
 and V) and the paths and texts Qwen wrote in its tool calls.
 
 Mounting fills what a fresh session needs from the index: the lookup layer's rows (path -> I),
-the version table (I -> V), the name table (I -> path, for list_files) and the file count.
-Everything else starts empty: the idle state. Paging a file in, when the model emits its read
+the version table (I -> V), the name table (I -> path, for list_files) and the file count; and
+from the texts, the search rows: one per distinct word of each file, keyed as at the word's end
+(I, V, its form; the forms come from the model's own embeddings). Everything else starts empty:
+the idle state. Paging a file in, when the model emits its read
 ack, builds its copy-layer rows from its token ids: the features the copy head saw when the
 text was written (data flag, I, V, offset, token id) through the layer's k_proj, k_norm, v_proj.
 """
@@ -25,6 +27,7 @@ import torch
 from transformers.cache_utils import DynamicCache
 
 from qfs import circuit as F
+from qfs import words
 
 LOOKUP, PAIR, COPY, TABLE, COUNTL = F.LOOKUP, F.PAIR, F.COPY, F.TABLE, F.COUNTL
 NO_TOKEN = 0xFFFFFFFF
@@ -145,6 +148,35 @@ def copy_rows(model, i, v, body):
     return kv(model.model.layers[COPY].self_attn, x)
 
 
+def word_table(model):
+    """The word forms and flags the model's embeddings carry (as qfs.words.table has them)."""
+    if not hasattr(model, "_qfs_words"):
+        E = model.model.embed_tokens.weight
+        bits = 1 << torch.arange(F.IDB, device=E.device)
+        slots = torch.stack([((E[:, F.WFORM[r]] > 0).long() * bits).sum(1) for r in range(F.S)], 1)
+        flags = E[:, [F.WD, F.SP, F.X1]] > 0.5
+        model._qfs_words = (slots.cpu().numpy(), flags.cpu().numpy())
+    return model._qfs_words
+
+
+def search_rows(model, files):
+    """Search rows of stored files ({I: (path, V, text)}): one per distinct word of each, with the
+    features its end had when the text was written."""
+    slots, flags = word_table(model)
+    rows = [(i, v, form) for i, (_, v, body) in sorted(files.items())
+            for form in sorted(set(words.words(body, slots, flags).values()))
+            if words.NEVER not in form]
+    x = torch.zeros(len(rows), F.H)
+    x[:, F.ONE] = 1
+    x[:, F.XT] = 1
+    for n, (i, v, form) in enumerate(rows):
+        x[n, F.XI] = pmv(i, F.IB)
+        x[n, F.XV] = pmv(v, F.VB)
+        for r in range(F.S):
+            x[n, F.XW[r]] = pmv(form[r], F.IDB)
+    return kv(model.model.layers[COPY].self_attn, x)
+
+
 def lookup_rows(model, recs):
     """Lookup-layer rows, one per file: its path -> its index (as at a write's ack)."""
     x = torch.zeros(len(recs), F.H)
@@ -229,8 +261,9 @@ def mount(model, path, dev):
              for li, kind in enumerate(F.LAYERS) if kind == "linear_attention"}
     for r in recs:
         i = int(r["i"])
-        row = dual(F.bits(int(r["v"]), F.VB))                     # version table
-        state[TABLE][0, 0, i, :len(row)] = torch.tensor(row)
+        row = dual(F.bits(int(r["v"]), F.VB))                     # version table, and its
+        state[TABLE][0, 0, i, :len(row)] = torch.tensor(row)      # copy a search reads
+        state[TABLE][0, 1 + F.NSLOT, i, :len(row)] = torch.tensor(row)
         for j, c in enumerate(slot_codes(r)):                     # name table: a head per slot
             vals = dual([(b + 1) // 2 for b in c])
             state[TABLE][0, 1 + j, i, :len(vals)] = torch.tensor(vals)
@@ -249,9 +282,8 @@ def mount(model, path, dev):
         layer.recurrent_states[0].copy_(rec)
         layer.has_previous_state[0] = True
     put(cache, LOOKUP, *lookup_rows(model, recs))
-    n_kv = model.model.layers[COPY].self_attn.k_proj.out_features // F.HD
-    empty = torch.zeros(1, n_kv, 0, F.HD, dtype=torch.bfloat16, device=dev)
-    put(cache, COPY, empty, empty)
+    files, _ = load(path)
+    put(cache, COPY, *search_rows(model, files))      # the copy rows page in on reads
     return cache, {int(r["i"]): int(r["v"]) for r in recs}
 
 

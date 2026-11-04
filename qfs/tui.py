@@ -37,6 +37,7 @@ EXAMPLES = [
     "Add bread to my shopping list.",
     "Save projects/cafe.txt: a new cafe opening in March. Link Alice's file to it.",
     "Who works on the cafe project? Check which files link to it.",
+    "Which of my files mention Paris? Search for it.",
 ]
 TOOLS = [  # (tool, what it does)
     ("write_file", "save a file (folders: people/alice.txt)"),
@@ -44,6 +45,7 @@ TOOLS = [  # (tool, what it does)
     ("list_files", "every path"),
     ("link_files", "link a file to another; unlink_files removes it"),
     ("list_links", "a file's links; list_backlinks: the files linking to it"),
+    ("search_files", "the files that have a word"),
 ]
 DISK = "fs"  # where the filesystem persists by default
 COMMANDS = [  # (command, arguments, what it does)
@@ -111,10 +113,10 @@ def size(n: int) -> str:
 
 
 def call_arg(func: str, params: dict) -> str:
-    """A call as its one line shows it: the path, or both paths of a link."""
+    """A call as its one line shows it: the path, both paths of a link, or the query."""
     if "target" in params:
         return f"{params.get('name', '?').strip()} → {params['target'].strip()}"
-    for k in ("name", "file", "path"):
+    for k in ("name", "file", "path", "query"):
         if k in params:
             return params[k].strip()
     return ""
@@ -986,7 +988,8 @@ class QFS(App):
             fs.doing = {"write_file": f"saving {arg}", "read_file": f"reading {arg}",
                         "list_files": "listing the files", "link_files": f"linking {arg}",
                         "unlink_files": f"unlinking {arg}", "list_links": f"links of {arg}",
-                        "list_backlinks": f"backlinks of {arg}"}.get(func, func)
+                        "list_backlinks": f"backlinks of {arg}",
+                        "search_files": f"searching for {arg}"}.get(func, func)
             self._say("The filesystem is answering")
         elif e.kind == "response":
             ack, lines = d["ack"], d["lines"]

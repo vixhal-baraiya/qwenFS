@@ -20,7 +20,7 @@ LAYERS = [
     ("4", "DeltaNet", "version table, path table"),
     ("5", "DeltaNet", "held acks; MLP: forced tokens"),
     ("6", "DeltaNet", "link bits"),
-    ("7", "attention", "copy: the files' text"),
+    ("7", "attention", "copy: the files' text; search"),
 ]
 
 
@@ -101,6 +101,9 @@ class Monitor:
                 lit.append(4)                      # a listed path: the path table
                 if func in ("list_links", "list_backlinks"):
                     lit.append(6)                  # the next set link bit
+            if func == "search_files" and (F.MARK0 <= t < F.MARK0 + F.NFILE
+                                           or F.SKIP0 <= t < F.SKIP0 + F.NFILE):
+                lit += [4, 7]                      # a file checked: its version, the words
             elif F.ACKW0 <= t < F.ACKR0:
                 lit += [3, 4]                      # a write: lookup and the version table
             elif F.ACKR0 <= t < F.NONE:

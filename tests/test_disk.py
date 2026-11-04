@@ -1,6 +1,7 @@
 """The filesystem from disk: session A writes files through tool calls, its image is cut from the log,
 and a fresh session B (empty context) lists, reads, writes and lists again, paging files in when
-the model emits their read acks. B runs one token at a time; every forced token is checked
+the model emits their read acks, and searches (the search rows are built at mount, so a search
+finds unpaged files too). B runs one token at a time; every forced token is checked
 against the model's own prediction. The control runs B without paging. Last, B's chat is saved
 over the image it mounted (as the app's disk does after every turn), twice.
 
@@ -18,6 +19,7 @@ import torch
 
 from qfs import bridge, disk
 from qfs import circuit as F
+from qfs import words as W
 from qfs.chat import Chat
 from tests.test_circuit import Session, names, text
 
@@ -47,7 +49,8 @@ def main():
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
         model = Qwen3_5ForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16).to(dev).eval()
     else:
-        model = F.build(dev, F.calibrate(dev))
+        model = F.build(dev, F.calibrate(dev), W.table(W.tokenizer(), F.VOCAB))
+    Session.words = W.table(W.tokenizer(a.model), F.VOCAB)
     rng = random.Random(a.seed)
     path = Path(tempfile.mkdtemp(prefix="qfs4-"))
 
@@ -101,6 +104,9 @@ def main():
         B.list_backlinks(nm)
     for nm in (fresh[0], fresh[1]):
         B.read(nm)
+    forms = [f for nm in stored for f in B.word_forms(nm) if W.NEVER not in f]
+    for f in rng.sample(forms, min(6, len(forms))) + [(W.EMPTY,) * W.S]:
+        B.search([t for t in reversed(f) if t != W.EMPTY])     # (the last: an empty query)
     print(f"session B: {len(B.toks)} tokens, {len(B.reads)} reads/listings, {len(B.forced)} forced")
     for paging in (True, False):
         t0 = time.time()

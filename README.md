@@ -26,6 +26,7 @@ assistant turn, and Qwen answers.
 | `unlink_files(name, target)` | remove that link | `removed` and both paths |
 | `list_links(file)` | files a file links to | one path per line, or `empty` |
 | `list_backlinks(path)` | files that link to a file | one path per line, or `empty` |
+| `search_files(query)` | files whose text has a word | one path per line, or `empty` |
 
 Paths make folders (`people/alice.txt`, `projects/cafe.txt`); links and backlinks make a graph.
 
@@ -33,14 +34,18 @@ Paths make folders (`people/alice.txt`, `projects/cafe.txt`); links and backlink
 
 - **Attention** holds the files. A write's text stays in the copy layer's attention log, keyed by
   (file index, version, offset); a read is an exact copy, token by token. A second attention head
-  looks paths up: a path finds its file's index, or falls back to "not found".
+  looks paths up: a path finds its file's index, or falls back to "not found". A third
+  searches: every word of a written text is a row, keyed by (file index, version, the word's
+  tokens), and a search checks one file per response token, against that file's current
+  version, so a word only an old version had is not found.
 - **Gated DeltaNet state** holds the tables and registers: the version table, the path table
   (for listings), the file count, the call's state, and the links. A link is a row of state per
   (source, target) pair: `link_files` writes it, `unlink_files` empties it, so links never
   duplicate. Rows store their bit in the target's column and in the source's, and a multi-hot
   query over a file's rows reads all its links, or all its backlinks, at once.
 - **MLPs** parse the tool calls and pick every forced token: acks, the response frame, echoed
-  paths, the next link to list.
+  paths, the next link to list, a search's next match. A file a search passes over gets a skip
+  token, which Qwen reads as a newline.
 - **Offsets** come from a decaying DeltaNet counter, read in the head norm's eps regime and
   decoded exactly to 600 tokens.
 
@@ -49,16 +54,16 @@ Registers pad their state rows to 2, 8, 32 or 128 set rails, so reads come back 
 or ±1. A key that is off sits far below zero, since a DeltaNet key's l2-norm would rescale any
 small value to full strength. `qfs/circuit.py` describes each layer.
 
-**The merge.** `qfs.merge` widens Qwen's residual from 2048 to 3072, zero-pads its matrices,
-scales its norm gains by √(2048/3072), puts the FS layers in front of Qwen's and appends the FS
+**The merge.** `qfs.merge` widens Qwen's residual from 2048 to 3584, zero-pads its matrices,
+scales its norm gains by √(2048/3584), puts the FS layers in front of Qwen's and appends the FS
 tokens to the vocabulary. The FS layers clear their dims before Qwen's layers run, except a small
 output code that the tied lm_head reads at the end, so a forced token wins and Qwen's logits are
 untouched everywhere else.
 
 **Disk.** A filesystem saves to a compact image: the paths, the latest text of each file as
 3-byte token ids, and the links (about 3.3–3.8 bytes per stored token). A fresh session mounts
-the image (the tables and lookup rows) and pages a file's text in only when the model emits that
-file's read ack. Paging rebuilds the copy rows from the token ids with the model's own
+the image (the tables, the lookup rows and the search rows, one per distinct word of each file)
+and pages a file's text in only when the model emits that file's read ack. Paging rebuilds the copy rows from the token ids with the model's own
 projections. See `qfs/disk.py`.
 
 ## What runs where
@@ -104,7 +109,9 @@ On Qwen3.5-2B, on Apple silicon (MPS, bf16):
 
 - 32 files, paths of up to 8 tokens, about 590 tokens per write, 63 versions per file; a text
   cannot contain `</`.
-- No search inside files and no partial edits: changing a file means writing it again.
+- Search finds one whole word, exactly and case-sensitively (`Paris`, not `paris`), of up to 3
+  tokens as Qwen writes the word alone; longer words are not found.
+- No partial edits: changing a file means writing it again.
 - Qwen's judgment is the weak part, not the filesystem: it sometimes answers from the
   conversation instead of reading a file, or makes calls it wasn't asked for.
 - About 20 tokens/s on MPS (PyTorch fallback kernels for Gated DeltaNet).

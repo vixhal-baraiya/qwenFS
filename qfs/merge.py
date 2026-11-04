@@ -23,6 +23,7 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
 from qfs import circuit as F
+from qfs import words
 
 PREFIX = "model.language_model."
 FS_LAYERS = F.LAYERS
@@ -93,12 +94,14 @@ def merge(src, xs, gain):
             else:
                 p[tuple(slice(0, s) for s in t.shape)] = t
         E = model.model.embed_tokens.weight
-        F.embeddings(E)
+        F.embeddings(E, words.table(words.tokenizer(src), F.VOCAB))
         # ack tokens look like a newline to Qwen's layers (RMSNorm undoes the scale); scaled
         # down, their Qwen logit stays below the newline's, so Qwen never writes one itself
         E[F.ACKW0:F.NONE + 1, :d0] = (ALIAS * E[F.NL, :d0].float()).to(E.dtype)
         # list markers look like "-" (a list bullet), scaled down for the same reason
         E[F.MARK0:F.MARK0 + F.NFILE, :d0] = (ALIAS * E[F.DASH, :d0].float()).to(E.dtype)
+        # search skips look like a newline, as acks do
+        E[F.SKIP0:F.SKIP0 + F.NFILE, :d0] = (ALIAS * E[F.NL, :d0].float()).to(E.dtype)
         F.fill(model.model.layers[:len(FS_LAYERS)], xs)
         F.code_gain(model.model.norm, gain)
     model.tie_weights()

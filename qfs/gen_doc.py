@@ -2,7 +2,7 @@
 
 The worked examples are one session run on the merged model: the example calls are fed in as
 Qwen's own tool calls, and each response shown is the one the circuit printed (acks are blank
-to Qwen, markers read as "-"). Calls are written as write_file(name="...") rather than tool-call
+to Qwen, markers read as "-", a search's skips are blank). Calls are written as write_file(name="...") rather than tool-call
 syntax, which the circuit would run.
 
 Usage: python -m qfs.gen_doc MERGED [--out docs/fs-agent.md]
@@ -32,6 +32,7 @@ truth, so to answer about something saved, read it first.
 | unlink_files: name, target | remove that one link | removed, the two paths |
 | list_links: file | see the files a file links to | one path per line, or "empty" |
 | list_backlinks: path | see the files that link to a file | one path per line, or "empty" |
+| search_files: query | find the files whose text has a word | one path per line, or "empty" |
 
 A missing file gives "not found".
 
@@ -44,6 +45,8 @@ A missing file gives "not found".
 - Do what the user asked and nothing more: link files only when asked.
 - To change a file, read it, then write its complete new text.
 - To remove one link, unlink exactly that pair; the other links stay.
+- To find files by what they say, search one word, spelled as in the files: search_files
+  matches whole words exactly, and capitals count (Berlin, not berlin).
 - Limits: 32 files, about 500 words per file.
 
 ## Examples
@@ -70,6 +73,9 @@ EXAMPLES = [
     ("Save a project note: the website launch is on May 5.",
      [("write_file", {"name": "projects/website.txt", "text": "The website launch is on May 5."})],
      "I saved the note to projects/website.txt."),
+    ("Who do I know in Berlin?",
+     [("search_files", {"query": "Berlin"})],
+     "Sam: he is an engineer in Berlin."),
     ("Sam works on the website project. Link them.",
      [("link_files", {"name": "people/sam.txt", "target": "projects/website.txt"})],
      "I linked Sam to the website project."),
@@ -101,10 +107,10 @@ def shown(func, params):
 
 
 def render(tok, ids):
-    """Response tokens as Qwen reads them: acks blank, markers as "-"."""
+    """Response tokens as Qwen reads them: acks and skips blank, markers as "-"."""
     out = []
     for t in ids:
-        if F.ACKW0 <= t <= F.NONE:
+        if F.ACKW0 <= t <= F.NONE or F.SKIP0 <= t < F.SKIP0 + F.NFILE:
             continue
         out.append("-" if F.MARK0 <= t < F.MARK0 + F.NFILE else tok.decode([t]))
     return "".join(out).strip("\n")
